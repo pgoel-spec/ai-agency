@@ -97,7 +97,59 @@ def update_linear_ticket(issue_id: str, message: str) -> str:
     return f"Failed to update ticket: {response.text}"
 
 @tool
-def create_github_pr(commit_message: str, pr_title: str, pr_body: str) -> str:
+def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body: str) -> str:
+    """
+    Commits all changed files in the persistent E2B workspace, pushes to a new branch, and opens a Pull Request.
+    You MUST provide the ticket_id (e.g., AI-5) so the branch is named correctly.
+    """
+    github_token = os.environ.get("GITHUB_TOKEN")
+    repo_full = os.environ.get("GITHUB_REPO") 
+    
+    if not github_token or not repo_full:
+        return "Error: GITHUB_TOKEN or GITHUB_REPO environment variable is missing."
+        
+    repo_folder = repo_full.split("/")[-1].replace(".git", "")
+    workspace = get_or_create_workspace()
+    
+    # Inject the Linear Ticket ID directly into the branch name!
+    new_branch = f"ai-feature-{ticket_id}"
+    
+    git_commands = f"""
+    cd {repo_folder}
+    git config --global user.email "ai@agency.dev"
+    git config --global user.name "AI DevOps"
+    git checkout -b {new_branch}
+    git add .
+    git commit -m "{commit_message}"
+    git push https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git {new_branch}
+    """
+    
+    execution = workspace.commands.run(git_commands)
+    if execution.error and "nothing to commit" not in execution.stdout:
+        return f"Git Push Error:\nSTDOUT: {execution.stdout}\nSTDERR: {execution.stderr}"
+        
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    base_url = f"https://api.github.com/repos/{repo_full}"
+    
+    pr_resp = requests.post(
+        f"{base_url}/pulls",
+        headers=headers,
+        json={
+            "title": pr_title,
+            "body": pr_body,
+            "head": new_branch,
+            "base": "main"
+        }
+    )
+    
+    if pr_resp.status_code == 201:
+        pr_url = pr_resp.json().get("html_url")
+        return f"Successfully pushed code and created PR! Review it here: {pr_url}"
+    else:
+        return f"Git push succeeded, but PR creation failed: {pr_resp.text}"
     """
     Commits all changed files in the persistent E2B workspace, pushes to a new branch, and opens a Pull Request.
     Use this when the Developer has finished making changes to the cloned repository.

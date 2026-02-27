@@ -149,8 +149,9 @@ def devops_node(state: AgencyState) -> dict:
     
     system_prompt = SystemMessage(content=(
         "You are a DevOps Engineer. The Developer has successfully modified and tested the code in the shared workspace. "
-        "Step 1: Use the create_github_pr tool to commit all workspace changes, push them to a new branch, and open a Pull Request. "
-        "Step 2: Once the PR is created, use the update_linear_ticket tool to post the real GitHub PR URL back to the human manager."
+        "Step 1: Identify the exact Linear Ticket ID from the conversation history (e.g., AI-5). "
+        "Step 2: Use the create_github_pr tool to commit all workspace changes and open a Pull Request. You MUST pass the Ticket ID to this tool. "
+        "Step 3: Once the PR is created, use the update_linear_ticket tool to post the GitHub PR URL back to the human manager."
     ))
     
     response = devops_llm.invoke([system_prompt] + state["messages"])
