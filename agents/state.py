@@ -1,17 +1,25 @@
-from typing import Annotated, Sequence, TypedDict, Literal
+from typing import Annotated, Sequence, TypedDict
 from langchain_core.messages import BaseMessage
-import operator
+from langgraph.graph.message import add_messages
+
+# --- GLOBAL CONFIGURATION ---
+DEVELOPER_ITERATION_LIMIT = 15
 
 class AgencyState(TypedDict):
     # The core conversation and code history
     # operator.add ensures new messages are appended, not overwritten
-    messages: Annotated[Sequence[BaseMessage], operator.add]
+    messages: Annotated[Sequence[BaseMessage], add_messages]
     
     # Tracks the current Linear/Jira ticket for HITL updates
-    active_ticket_url: str 
+    active_ticket_url: str
     
     # The router flag: The Manager updates this to dictate the next step
-    next_agent: Literal["Developer", "DevOps", "FINISH"]
+    next_agent: str
     
-    # Sandbox feedback loop: tracks consecutive QA failures to prevent infinite loops
+    # Sandbox feedback loop: Tracks consecutive QA failures to prevent infinite loops
     dev_iteration_count: int
+
+    # Track phase and status explicitly
+    current_phase: str
+    current_status: str
+    last_report: str

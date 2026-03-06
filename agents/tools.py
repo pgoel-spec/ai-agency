@@ -2,34 +2,144 @@ import os
 import requests
 import base64
 import time
+from datetime import datetime
 from e2b_code_interpreter import Sandbox
+from pydantic import BaseModel, Field
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableConfig
 
-# Global variable to keep the workspace alive across multiple tool calls
-current_workspace = None
+# Create schemas to hide the 'workspace' parameter from the LLM
+class TerminalInput(BaseModel):
+    command: str = Field(description="The shell command to execute")
 
-def get_or_create_workspace():
-    global current_workspace
-    if current_workspace is None:
-        # Securely pass both variables into the E2B environment
-        current_workspace = Sandbox(
-            timeout=600, 
+class ReadFileInput(BaseModel):
+    file_path: str = Field(description="Path to the file to read")
+
+class WriteFileInput(BaseModel):
+    file_path: str = Field(description="Path to the file")
+    content: str = Field(description="Content to write")
+
+class GitHubPRInput(BaseModel):
+    ticket_id: str = Field(description="Linear ticket ID")
+    commit_message: str = Field(description="Commit message")
+    pr_title: str = Field(description="PR Title")
+    pr_body: str = Field(description="PR Body")
+
+def _parse_github_time(ts_str: str) -> datetime:
+    """Safely converts a GitHub ISO 8601 string to a datetime object."""
+    if not ts_str:
+        return None
+    return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+
+def get_latest_pr(ticket_id: str) -> dict:
+    """Fetches the latest PR for the ticket and returns its branch and timestamp."""
+    github_token = os.environ.get("GITHUB_TOKEN")
+    repo_full = os.environ.get("GITHUB_REPO")
+    
+    if not github_token or not repo_full:
+        return None
+        
+    url = f"https://api.github.com/repos/{repo_full}/pulls?state=open&sort=updated&direction=desc"
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    resp = requests.get(url, headers=headers)
+    if resp.status_code == 200:
+        for pr in resp.json():
+            head_ref = pr.get("head", {}).get("ref", "")
+            if ticket_id.lower() in head_ref.lower():
+                return {
+                    "name": head_ref,
+                    "timestamp": _parse_github_time(pr.get("updated_at"))
+                }
+    return None
+
+def get_wip_branch(ticket_id: str) -> dict:
+    """Fetches the WIP recovery branch for the ticket and returns its timestamp."""
+    github_token = os.environ.get("GITHUB_TOKEN")
+    repo_full = os.environ.get("GITHUB_REPO")
+    
+    if not github_token or not repo_full:
+        return None
+        
+    wip_name = f"wip-recovery-{ticket_id}"
+    url = f"https://api.github.com/repos/{repo_full}/branches/{wip_name}"
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    resp = requests.get(url, headers=headers)
+    if resp.status_code == 200:
+        ts_str = resp.json().get("commit", {}).get("commit", {}).get("author", {}).get("date")
+        return {
+            "name": wip_name,
+            "timestamp": _parse_github_time(ts_str)
+        }
+    return None
+
+def get_best_resume_branch(ticket_id: str) -> dict:
+    """
+    Compares the PR and WIP branches using their dedicated fetchers.
+    Returns the winning 'branch_name' and its 'type'.
+    """
+    pr_info = get_latest_pr(ticket_id)
+    wip_info = get_wip_branch(ticket_id)
+
+    # Both exist: Compare timestamps
+    if pr_info and wip_info:
+        if wip_info["timestamp"] and pr_info["timestamp"] and wip_info["timestamp"] > pr_info["timestamp"]:
+            return {"branch_name": wip_info["name"], "type": "wip"}
+        return {"branch_name": pr_info["name"], "type": "pr"}
+        
+    # Only one exists
+    elif pr_info:
+        return {"branch_name": pr_info["name"], "type": "pr"}
+    elif wip_info:
+        return {"branch_name": wip_info["name"], "type": "wip"}
+        
+    # Neither exists
+    return None
+
+# Update tools to accept the workspace from the node runner
+@tool(args_schema=TerminalInput)
+def run_terminal_command(command: str, config: RunnableConfig) -> str:
+    """
+    Executes a bash command in the terminal. 
+    Has a strict timeout. For background processes, use the 'start, curl, kill' pattern.
+    """
+    workspace = config.get("configurable", {}).get("sandbox")
+    if not workspace:
+        return "Error: No active sandbox found in configuration."
+
+    # --- ENFORCE GITIGNORE BEFORE INSTALLS ---
+    # Detect if the agent is trying to install massive dependency folders
+    install_keywords = [
+        "npm install", "npm i", "yarn add", "yarn install", 
+        "pnpm install", "pnpm i", "pip install", "poetry install"
+    ]
+    
+    if any(keyword in command.lower() for keyword in install_keywords):
+        # Dynamically prepend a bash script to safely append standard ignores 
+        # and remove duplicates (using sort -u) without interrupting the actual command.
+        gitignore_safeguard = (
+            "echo -e 'node_modules/\\nvenv/\\n.venv/\\n__pycache__/\\n*.pyc\\n.env\\n.next/\\nbuild/\\ndist/' >> .gitignore;"
+            "sort -u .gitignore -o .gitignore;"
+        )
+        command = f"{gitignore_safeguard}\n{command}"
+
+    try:
+        # We execute the modified command string in the E2B sandbox
+        execution = workspace.commands.run(
+            command,
             envs={
                 "GITHUB_TOKEN": os.environ.get("GITHUB_TOKEN"),
-                "GITHUB_REPO": os.environ.get("GITHUB_REPO")
-            }
+                "GITHUB_REPO": os.environ.get("GITHUB_REPO"),
+            },
+            timeout=15
         )
-    return current_workspace
-
-@tool
-def run_terminal_command(command: str) -> str:
-    """
-    Executes a shell/bash command in the persistent cloud workspace.
-    Use this for: git clone, ls, cat, pip install, pytest, python main.py, etc.
-    """
-    try:
-        workspace = get_or_create_workspace()
-        execution = workspace.commands.run(command)
         
         output = ""
         if execution.stdout:
@@ -37,24 +147,37 @@ def run_terminal_command(command: str) -> str:
         if execution.stderr:
             output += f"STDERR:\n{execution.stderr}\n"
             
-        return output if output else "Command executed successfully (no output)."
+        if execution.error and not execution.stderr:
+            output += "\nProcess exited with error code but no STDERR."
+            
+        return output if output else "Command executed successfully with no output."
+        
+    except TimeoutError:
+         return "Error: Command timed out after 15 seconds. If you started a persistent server, you must run it in the background and kill it in the same command block."
     except Exception as e:
-        return f"Terminal Error: {str(e)}"
+         return f"Terminal Error: {str(e)}"
 
-@tool
-def read_file(file_path: str) -> str:
+@tool(args_schema=ReadFileInput)
+def read_file(file_path: str, config: RunnableConfig) -> str:
     """Reads the full contents of a file inside the workspace."""
+
+    workspace = config.get("configurable", {}).get("sandbox")
+    if not workspace:
+        return "Error: No active sandbox found in configuration."
+
     try:
-        workspace = get_or_create_workspace()
         return workspace.files.read(file_path)
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
-@tool
-def write_file(file_path: str, content: str) -> str:
+@tool(args_schema=WriteFileInput)
+def write_file(file_path: str, content: str, config: RunnableConfig) -> str:
     """Overwrites a file (or creates a new one) inside the workspace with new code."""
+    workspace = config.get("configurable", {}).get("sandbox")
+    if not workspace:
+        return "Error: No active sandbox found in configuration."
+
     try:
-        workspace = get_or_create_workspace()
         workspace.files.write(file_path, content)
         return f"Successfully saved changes to {file_path}"
     except Exception as e:
@@ -96,112 +219,153 @@ def update_linear_ticket(issue_id: str, message: str) -> str:
         return f"Successfully posted update to ticket {issue_id}"
     return f"Failed to update ticket: {response.text}"
 
+@tool(args_schema=GitHubPRInput)
+def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body: str, config: RunnableConfig) -> str:
+    """
+    Commits all changed files, pushes to a branch, and opens a Pull Request.
+    If an open PR already exists for this ticket, it dynamically updates that PR instead of creating a duplicate.
+    """
+    workspace = config.get("configurable", {}).get("sandbox")
+    if not workspace:
+        return "Error: No active sandbox found in configuration."
+    
+    github_token = os.environ.get("GITHUB_TOKEN")
+    repo_full = os.environ.get("GITHUB_REPO") 
+    
+    if not github_token or not repo_full:
+        return "Error: GITHUB_TOKEN or GITHUB_REPO environment variable is missing."
+    
+    # Define a clean envs dict to reuse
+    tool_envs = {
+        "GITHUB_TOKEN": github_token,
+        "GITHUB_REPO": repo_full
+    }
+
+    repo_folder = repo_full.split("/")[-1].replace(".git", "")
+
+    # This calls the same function that main.py uses to check for PRs
+    existing_pr = get_latest_pr(ticket_id)
+
+    if existing_pr:
+        # PATH A: Update Existing PR
+        existing_branch = existing_pr["name"]
+        
+        # We push the current working state (HEAD) directly to the PR branch.
+        git_commands = f"""
+        cd {repo_folder}
+        git config --global user.email "ai@agency.dev"
+        git config --global user.name "AI DevOps"
+        
+        git add .
+        git commit -m "{commit_message}" || echo "nothing to commit"
+        
+        # Use the variable explicitly in the string construction
+        git push https://$GITHUB_TOKEN@github.com/{repo_full}.git HEAD:refs/heads/{existing_branch} --force
+        """
+        
+        try:
+            execution = workspace.commands.run(git_commands, envs=tool_envs)
+            if execution.error and "nothing to commit" not in execution.stdout:
+                return f"Git Push Error:\nSTDOUT: {execution.stdout}\nSTDERR: {execution.stderr}"
+            return f"Successfully updated the existing Pull Request on branch '{existing_branch}'!"
+        except Exception as e:
+            return f"Git Execution failed: {str(e)}"
+            
+    else:
+        # PATH B: Create New PR
+        timestamp = int(time.time())
+        new_branch = f"ai-feature-{ticket_id}-{timestamp}"
+        
+        git_commands = f"""
+        cd {repo_folder}
+        git config --global user.email "ai@agency.dev"
+        git config --global user.name "AI DevOps"
+        git checkout -b {new_branch}
+        git add .
+        git commit -m "{commit_message}"
+        # Use the variable explicitly here too
+        git push https://$GITHUB_TOKEN@github.com/{repo_full}.git {new_branch}
+        """
+        
+        try:
+            execution = workspace.commands.run(git_commands, envs=tool_envs)
+            if execution.error and "nothing to commit" not in execution.stdout:
+                return f"Git Push Error:\nSTDOUT: {execution.stdout}\nSTDERR: {execution.stderr}"
+        except Exception as e:
+            return f"Git Execution failed: {str(e)}"
+            
+        # Create the PR via GitHub API
+        headers = {
+            "Authorization": f"Bearer {github_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        base_url = f"https://api.github.com/repos/{repo_full}"
+        
+        pr_resp = requests.post(
+            f"{base_url}/pulls",
+            headers=headers,
+            json={
+                "title": pr_title,
+                "body": pr_body,
+                "head": new_branch,
+                "base": "main"
+            }
+        )
+        
+        if pr_resp.status_code == 201:
+            pr_url = pr_resp.json().get("html_url")
+            return f"Successfully pushed code to branch '{new_branch}' and created PR! Review it here: {pr_url}"
+        else:
+            return f"Git push succeeded, but PR creation failed: {pr_resp.text}"
+
 @tool
-def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body: str) -> str:
+def sync_wip_commit(commit_message: str, config: RunnableConfig) -> str:
     """
-    Commits all changed files in the persistent E2B workspace, pushes to a new branch, and opens a Pull Request.
-    You MUST provide the ticket_id (e.g., AI-5) so the branch is named correctly.
+    Saves your current progress to a temporary remote WIP branch so it is not lost if the server crashes.
+    Call this whenever you finish writing a significant piece of code, before moving on.
     """
+    workspace = config.get("configurable", {}).get("sandbox")
+    if not workspace:
+        return "Error: No active sandbox found in configuration."
+        
     github_token = os.environ.get("GITHUB_TOKEN")
-    repo_full = os.environ.get("GITHUB_REPO") 
+    repo_full = os.environ.get("GITHUB_REPO")
     
     if not github_token or not repo_full:
         return "Error: GITHUB_TOKEN or GITHUB_REPO environment variable is missing."
-        
+
+    # Standard temporary backup branch name
+    ticket_id = config.get("configurable", {}).get("thread_id", "unknown")
+    wip_branch = f"wip-recovery-{ticket_id}"
+
+    # Extract repo folder
     repo_folder = repo_full.split("/")[-1].replace(".git", "")
-    workspace = get_or_create_workspace()
-    
-    # Inject the Linear Ticket ID directly into the branch name!
-    new_branch = f"ai-feature-{ticket_id}"
-    
+
+    # The script uses HEAD:refs/heads/... to push the current state to the remote WIP branch
+    # without altering the agent's current local branch checkout.
     git_commands = f"""
     cd {repo_folder}
     git config --global user.email "ai@agency.dev"
-    git config --global user.name "AI DevOps"
-    git checkout -b {new_branch}
+    git config --global user.name "AI Developer"
+    
     git add .
-    git commit -m "{commit_message}"
-    git push https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git {new_branch}
+    git commit -m "WIP Sync: {commit_message}" || echo "Nothing to commit"
+    
+    # Force push the current local state (HEAD) directly to the remote WIP branch
+    git push https://$GITHUB_TOKEN@github.com/{repo_full}.git HEAD:refs/heads/{wip_branch} --force
     """
     
-    execution = workspace.commands.run(git_commands)
-    if execution.error and "nothing to commit" not in execution.stdout:
-        return f"Git Push Error:\nSTDOUT: {execution.stdout}\nSTDERR: {execution.stderr}"
+    try:
+        execution = workspace.commands.run(git_commands, envs={
+            "GITHUB_TOKEN": github_token,
+            "GITHUB_REPO": repo_full  # Add this line
+        })
+
+        # Properly evaluate standard bash errors
+        if execution.error and "Nothing to commit" not in execution.stdout:
+            return f"WIP Sync failed:\nSTDOUT: {execution.stdout}\nSTDERR: {execution.stderr}"
+            
+        return f"Successfully backed up current local state to remote branch '{wip_branch}'."
         
-    headers = {
-        "Authorization": f"Bearer {github_token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    base_url = f"https://api.github.com/repos/{repo_full}"
-    
-    pr_resp = requests.post(
-        f"{base_url}/pulls",
-        headers=headers,
-        json={
-            "title": pr_title,
-            "body": pr_body,
-            "head": new_branch,
-            "base": "main"
-        }
-    )
-    
-    if pr_resp.status_code == 201:
-        pr_url = pr_resp.json().get("html_url")
-        return f"Successfully pushed code and created PR! Review it here: {pr_url}"
-    else:
-        return f"Git push succeeded, but PR creation failed: {pr_resp.text}"
-    """
-    Commits all changed files in the persistent E2B workspace, pushes to a new branch, and opens a Pull Request.
-    Use this when the Developer has finished making changes to the cloned repository.
-    """
-    github_token = os.environ.get("GITHUB_TOKEN")
-    repo_full = os.environ.get("GITHUB_REPO") 
-    
-    if not github_token or not repo_full:
-        return "Error: GITHUB_TOKEN or GITHUB_REPO environment variable is missing."
-        
-    # Extract just the folder name (e.g., "ai-agency-test" from "princegoel/ai-agency-test")
-    repo_folder = repo_full.split("/")[-1].replace(".git", "")
-    workspace = get_or_create_workspace()
-    
-    import time
-    new_branch = f"ai-feature-{int(time.time())}"
-    
-    # 1. Execute native git commands inside the E2B workspace
-    git_commands = f"""
-    cd {repo_folder}
-    git config --global user.email "ai@agency.dev"
-    git config --global user.name "AI DevOps"
-    git checkout -b {new_branch}
-    git add .
-    git commit -m "{commit_message}"
-    git push https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git {new_branch}
-    """
-    
-    execution = workspace.commands.run(git_commands)
-    if execution.error and "nothing to commit" not in execution.stdout:
-        return f"Git Push Error:\nSTDOUT: {execution.stdout}\nSTDERR: {execution.stderr}"
-        
-    # 2. Use the GitHub REST API to open the Pull Request
-    headers = {
-        "Authorization": f"Bearer {github_token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    base_url = f"https://api.github.com/repos/{repo_full}"
-    
-    pr_resp = requests.post(
-        f"{base_url}/pulls",
-        headers=headers,
-        json={
-            "title": pr_title,
-            "body": pr_body,
-            "head": new_branch,
-            "base": "main"
-        }
-    )
-    
-    if pr_resp.status_code == 201:
-        pr_url = pr_resp.json().get("html_url")
-        return f"Successfully pushed code and created PR! Review it here: {pr_url}"
-    else:
-        return f"Git push succeeded, but PR creation failed: {pr_resp.text}"
+    except Exception as e:
+        return f"WIP Sync execution failed: {str(e)}"

@@ -1,38 +1,64 @@
 import os
+import json
+import copy
+from pydantic import BaseModel, Field
 from langchain_google_vertexai import ChatVertexAI
 from langchain_google_vertexai.model_garden import ChatAnthropicVertex
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
-from .state import AgencyState
-from .tools import update_linear_ticket, create_github_pr, run_terminal_command, read_file, write_file
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
+from .state import AgencyState, DEVELOPER_ITERATION_LIMIT
+from .tools import update_linear_ticket, create_github_pr, run_terminal_command, read_file, write_file, sync_wip_commit
+from database import get_logs_by_ticket
 
-# 1. Initialize the Models via Vertex AI
-# The Manager gets the Linear tool. The Dev gets the E2B Sandbox tool.
+# Define the Routing Schema
+class RouteDecision(BaseModel):
+    """Call this tool to route the task to the next appropriate team member."""
+    reasoning: str = Field(description="Your step-by-step reasoning for why you are choosing this agent.")
+    next_agent: str = Field(description="The name of the agent to route to. Must be 'Developer', 'DevOps', or 'FINISH'.")
+
+class ReportStatus(BaseModel):
+    """Call this tool to report your progress or completion back to the Manager."""
+    thought: str = Field(description="Detailed summary of the work you just completed and what the team should do next, or explanation of exactly what you are blocked on.")
+    phase: str = Field(description="The phase you just worked on (e.g., 'Implementation').")
+    status: str = Field(description="Must be 'IN_PROGRESS', 'COMPLETE', or 'BLOCKED'")
+
+class DevOpsReport(BaseModel):
+    """Call this tool to report your progress or completion back to the Manager."""
+    thought: str = Field(description="Detailed summary of the DevOps work completed (e.g., PRs created).")
+    status: str = Field(description="Must be 'IN_PROGRESS' or 'COMPLETE'")
+    pr_url: str = Field(description="The URL of the created PR, if applicable.", default="")
+
+manager_tools = [RouteDecision, update_linear_ticket]
+developer_tools = [ReportStatus, run_terminal_command, read_file, write_file, sync_wip_commit]
+devops_tools = [DevOpsReport, create_github_pr]
+
+# Initialize the Models via Vertex AI with JSON enforcement
 project_id = os.environ.get("PROJECT_ID")
 
+# Configuration common to all agents to ensure structured output
+json_config = {
+    # "model_kwargs": {"response_mime_type": "application/json"},
+    "project": project_id,
+    "max_retries": 2,
+    "vertexai": True,
+    "max_output_tokens": 8192
+}
+
 manager_llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-pro",
-    project=project_id,
-    max_retries=2,
-    vertexai=True, # This flag ensures it uses GCP/Vertex AI securely
-    max_output_tokens=8192
-).bind_tools([update_linear_ticket])
+    model="gemini-2.5-pro", # Recommended version for stable JSON
+    **json_config
+).bind_tools([RouteDecision, update_linear_ticket])
 
 devops_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-pro",
-    project=project_id,
-    max_retries=2,
-    vertexai=True,
-    max_output_tokens=8192
-).bind_tools([update_linear_ticket, create_github_pr])
+    **json_config
+).bind_tools(devops_tools)
 
 developer_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-pro",
-    project=project_id,
-    max_retries=2,
-    vertexai=True,
-    max_output_tokens=8192
-).bind_tools([run_terminal_command, read_file, write_file])
+    **json_config
+).bind_tools(developer_tools)
 
 """ developer_llm = ChatAnthropicVertex(
     project=project_id, 
@@ -42,145 +68,628 @@ developer_llm = ChatGoogleGenerativeAI(
 ).bind_tools([execute_sandbox_code])
  """
 
-def manager_node(state: AgencyState) -> dict:
-    """The Supervisor: Routes tasks and communicates with the human manager."""
-    system_prompt = SystemMessage(content=(
-        "You are the Engineering Manager of an autonomous AI dev team. "
-        "Review the conversation and the active ticket. "
-        "DO NOT write or execute code yourself. "
-        "If code needs to be written or tested, ONLY reply with 'ROUTE TO DEVELOPER'. "
-        "If tests have passed and code is ready to ship, ONLY reply with 'ROUTE TO DEVOPS'. "
-        "If a Preview URL is ready or the team is blocked, use your tool to update the Linear ticket, "
-        "then reply with 'ROUTE TO FINISH'."
-    ))
-    
-    response = manager_llm.invoke([system_prompt] + state["messages"])
-    
-    # Bulletproof the state: force list-based contents into standard strings
-    if isinstance(response.content, list):
-        content_str = response.content[0].get("text", "") if len(response.content) > 0 else ""
-        response.content = content_str
-    else:
-        content_str = str(response.content)
+# Helper function to extract names and descriptions
+def format_tool_descriptions(tools_list) -> str:
+    descriptions = []
+    for t in tools_list:
+        # Handle @tool decorators
+        if hasattr(t, "name") and hasattr(t, "description"):
+            descriptions.append(f"- {t.name}: {t.description}")
+        # Handle Pydantic BaseModels (like ReportStatus)
+        elif hasattr(t, "__name__") and hasattr(t, "__doc__"):
+            descriptions.append(f"- {t.__name__}: {t.__doc__}")
+    return "\n".join(descriptions)
 
-    # Prevent Gemini from crashing on empty strings
-    if not response.content or response.content.strip() == "":
-        response.content = "[Agent executing action]"
-        
-    # Make extraction case-insensitive
-    content_lower = content_str.lower()
-    next_agent = "Developer" 
-    if "route to devops" in content_lower:
-        next_agent = "DevOps"
-    elif "route to finish" in content_lower:
-        next_agent = "FINISH"
-        
-    # We MUST append the Manager's message to the state so the conversation moves forward!
-    messages_to_add = [response] 
+def get_tool_names(tools_list) -> list:
+    """Extracts just the names of the tools to show the Manager."""
+    names = []
+    for t in tools_list:
+        if hasattr(t, "name"):
+            names.append(t.name)         # For @tool functions
+        elif hasattr(t, "__name__"):
+            names.append(t.__name__)     # For Pydantic schemas
+    return names
+
+# Helper function for Filtering
+def filter_agent_history(messages: list, agent_role: str) -> list:
+    """Filters history so an agent only sees the Human request and its own past actions."""
     
-    # Execute Linear tool if Manager decides to use it
-    if response.tool_calls:
-        for tool in response.tool_calls:
+    dev_tool_names = get_tool_names(developer_tools)
+    devops_tool_names = get_tool_names(devops_tools)
+    manager_tool_names = get_tool_names(manager_tools)
+    
+    # Define what the agent IS allowed to see
+    allowed_tools = []
+    if agent_role == "Developer":
+        allowed_tools = dev_tool_names
+    elif agent_role == "DevOps":
+        allowed_tools = devops_tool_names
+    elif agent_role == "Manager":
+        allowed_tools = manager_tool_names + ["ReportStatus", "DevOpsReport"]
+    
+    # ---------------------------------------------------------
+    # SESSION BOUNDARY
+    # We explicitly look for the "source": "webhook" tag in additional_kwargs.
+    # ---------------------------------------------------------
+    last_real_human_index = -1
+    for i, msg in enumerate(messages):
+        # Safely get kwargs whether it's an object or tuple
+        kwargs = getattr(msg, "additional_kwargs", {})
+        
+        # Exact match for our custom webhook tag
+        if kwargs.get("source") == "webhook":
+            last_real_human_index = i
+    
+    filtered_messages = []
+    
+    for i, msg in enumerate(messages):
+        # Convert tuples to objects immediately so logic is consistent
+        if isinstance(msg, tuple):
+            m_type, m_content = msg[0], msg[1]
+            if m_type in ["user", "human"]:
+                msg = HumanMessage(content=m_content)
+            elif m_type == "ai":
+                msg = AIMessage(content=m_content)
+            else:
+                continue # Skip unknown tuple types
+
+        msg_type = getattr(msg, "type", "")
+        msg_kwargs = getattr(msg, "additional_kwargs", {})
+        
+        if msg_type == "human":
+            msg_name = getattr(msg, "name", "")
+            
+            # Is it the actual webhook? Let everyone see it.
+            if msg_kwargs.get("source") == "webhook":
+                filtered_messages.append(msg)
+            
+            # ==========================================
+            # BROADCAST PROTOCOL
+            # Any message tagged as "Broadcast" is globally visible to all agents.
+            # ==========================================
+            elif msg_name == "Broadcast":
+                filtered_messages.append(msg)
+            
+            # If the message is from the Manager, only show it if it's for THIS agent
+            elif msg_name == "Manager":
+                if f"Routing to {agent_role}" in msg.content:
+                    filtered_messages.append(msg)
+            else:
+                # Always include original client requests or human updates
+                filtered_messages.append(msg)
+            
+        elif msg_type == "tool":
+            # Only show tools that belong to this agent's specific role
+            if msg.name in allowed_tools:
+                filtered_messages.append(msg)
+                
+        elif msg_type == "ai":
+            # IDENTITY SHIELD: Prevent agents from stealing each other's text thoughts!
+            # if msg_name and msg_name.lower() not in [agent_role.lower(), "ai", ""]:
+            #    continue
+            
+            new_msg = msg.copy()
+
+            # PRUNING LOGIC:
+            # If the AI message happened BEFORE the last real webhook (last_real_human_index), 
+            # it's from an old session. Strip the signature to save tokens!
+            if last_real_human_index != -1 and i < last_real_human_index:
+                if hasattr(new_msg, "additional_kwargs") and "__gemini_function_call_thought_signatures__" in new_msg.additional_kwargs:
+                    new_msg.additional_kwargs = copy.deepcopy(new_msg.additional_kwargs)
+                    new_msg.additional_kwargs.pop("__gemini_function_call_thought_signatures__", None)
+
+            # Check if the tools are allowed for this specific agent
+            if hasattr(new_msg, "tool_calls") and new_msg.tool_calls:
+                is_allowed = all(tc["name"] in allowed_tools for tc in new_msg.tool_calls)
+                if is_allowed:
+                    filtered_messages.append(new_msg)
+            else:
+                # Always include text-only AI messages from the agent to themselves
+                filtered_messages.append(new_msg)
+                
+    return filtered_messages
+
+def manager_node(state: AgencyState) -> dict:
+    """The Supervisor: Routes tasks and updates Linear tickets based on team status."""
+    
+    messages = state.get("messages", [])
+    
+    # --- PRE-COMPUTE DEBUG CONTEXT ---
+    dev_iterations = state.get("dev_iteration_count", 0)
+    detailed_debug_context = ""
+
+    if dev_iterations >= DEVELOPER_ITERATION_LIMIT:
+        ticket_id = state.get("active_ticket_url", "UNKNOWN")
+        # Pull the last 20 raw events to give a broad look at the failure loop
+        try:
+            raw_logs = get_logs_by_ticket(ticket_id)[-20:] 
+            log_summary = "\n".join([
+                f"[{l['role']}]: {l['tool_name'] if l['tool_name'] else ''} -> {str(l['content'])[:400]}" 
+                for l in raw_logs
+            ])
+            
+            detailed_debug_context = (
+                f"\n\n[!!! CRITICAL AUDIT - ITERATION LIMIT {DEVELOPER_ITERATION_LIMIT} REACHED !!!]\n"
+                f"The Developer has attempted this task {dev_iterations} times without success. "
+                f"Below are the RAW terminal and tool logs from their last attempts.\n"
+                f"ACTION REQUIRED: Identify if they are repeating a mistake, hitting a sandbox restriction, "
+                f"or using an incorrect path. Provide an explicit 'STRATEGY PIVOT' in your reasoning.\n"
+                f"--- RAW LOG START ---\n{log_summary}\n--- RAW LOG END ---\n"
+            )
+        except Exception as e:
+            detailed_debug_context = f"\n[SYSTEM ERROR]: Failed to retrieve debug logs: {str(e)}"
+
+    # --- TEAM WORK LOG: Build a clean, chronological log from the team's reports ---
+    work_log_entries = []
+    is_blocked = False # Flag to check if we need human help
+    
+    for msg in messages:
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tool in msg.tool_calls:
+                if tool["name"] in ["ReportStatus", "DevOpsReport"]:
+                    status = tool["args"].get("status", "UNKNOWN")
+                    thought = tool["args"].get("thought", "")
+                    role = "Developer" if tool["name"] == "ReportStatus" else "DevOps"
+                    
+                    if status == "COMPLETE":
+                        work_log_entries.append(f"[{role} - {status}]: {thought}")
+                    elif status == "BLOCKED":
+                        is_blocked = True
+                        work_log_entries.append(f"[{role} - BLOCKED]: {thought}")
+
+    work_log_str = "\n".join(work_log_entries) if work_log_entries else "No work has been completed yet."
+    # print(work_log_str)
+
+    # 1. Safely Extract the Original Client Request (handles both tuples and Message objects)
+    original_task = "No task provided."
+    if messages:
+        first_msg = messages[0]
+        if isinstance(first_msg, tuple):
+            original_task = first_msg[1] # Extract the string from ("user", "string")
+        else:
+            original_task = first_msg.content # Extract from an actual AIMessage/HumanMessage
+
+    # 2. We look for the MOST RECENT message that contains "SYSTEM OVERRIDE"
+    current_run_instruction = "No specific override provided."
+    for msg in reversed(messages):
+        content = msg[1] if isinstance(msg, tuple) else getattr(msg, "content", "")
+        if "SYSTEM OVERRIDE" in content:
+            current_run_instruction = content
+            break
+
+    # 3. Correctly isolate ACTUAL recent human updates
+    real_human_messages = []
+    for msg in messages:
+        # Safely extract type and name
+        msg_type = msg[0] if isinstance(msg, tuple) else getattr(msg, "type", "")
+        msg_name = "" if isinstance(msg, tuple) else getattr(msg, "name", "")
+        
+        # Ignore our internal routing messages (which use name="Manager")
+        if msg_type in ["human", "user"] and msg_name != "Manager":
+            msg_content = msg[1] if isinstance(msg, tuple) else getattr(msg, "content", "")
+            real_human_messages.append(msg_content)
+
+    # 4. Detect a Human Resume and Extract the Latest Update
+    is_human_resume = False
+    latest_human_update = "No recent updates from human."
+    if len(real_human_messages) > 1:
+        # Only treat it as an update if the content differs from the original task
+        if real_human_messages[-1].strip() != original_task.strip():
+            is_human_resume = True
+            latest_human_update = real_human_messages[-1]
+
+    # Extract the current active status to see if someone was interrupted
+    current_status = state.get("current_status", "NOT_STARTED")
+    
+    # Add a fallback warning so the Manager knows if the Developer hit a timeout
+    status_warning = ""
+    if current_status == "IN_PROGRESS" and not is_blocked:
+        status_warning = "\n[SYSTEM WARNING]: The Developer was working but hit an iteration limit or timeout before calling ReportStatus. They are currently IN_PROGRESS. Route back to them so they can finish the job.\n"
+
+    # Dynamic Registry (Keep your existing available_agents list)
+    # This can eventually move to a config file or database
+    available_agents = [
+        {
+            "role": "Developer",
+            "skills": get_tool_names(developer_tools),
+            "description": "Best for writing code, modifying files, and local testing."
+        },
+        {
+            "role": "DevOps",
+            "skills": get_tool_names(devops_tools),
+            "description": "Best for creating Pull Requests and pushing code to Git."
+        }
+    ]
+
+    # The Intelligent Prompt
+    system_prompt = SystemMessage(content=(
+        f"You are an intelligent Engineering Manager coordinating an AI team.\n\n"
+        f"TEAM REGISTRY:\n{json.dumps(available_agents, indent=2)}\n\n"
+        
+        f"--- ORIGINAL CLIENT REQUEST ---\n"
+        f"{original_task}\n\n"
+
+        f"--- LATEST UPDATE FROM HUMAN ---\n"
+        f"{latest_human_update}\n\n" # This ensures the manager sees your resume instructions
+        
+        f"--- TEAM WORK LOG (History of Accomplishments) ---\n"
+        f"{work_log_str}\n"
+        f"{status_warning}\n" # Reset dev_iteration_count if this is uncommented to prevent infinite loops
+        f"{detailed_debug_context}\n"
+        f"--------------------------------------------------\n\n"
+        
+        "YOUR CORE RESPONSIBILITIES:\n"
+        "1. Read the Original Client Request and compare it against the Team Work Log.\n"
+        "2. If the [CRITICAL AUDIT] block is present, perform a deep-dive analysis of the raw logs to unblock the developer.\n"
+        "3. Intelligently deduce the current state of the project and what needs to happen next.\n\n"
+
+        "ROUTING RULES (Evaluate from top to bottom):\n"
+        "1. TIMEOUT RECOVERY: If you see a [SYSTEM WARNING] that the Developer hit a timeout, route back to the 'Developer' immediately so they can finish their thought.\n"
+        "2. RESUMING WORK: If the human just replied to a blocked ticket (meaning the blocker is resolved), route to the 'Developer' so they can resume work on the WIP branch even if the previous status was 'BLOCKED'.\n"
+        "3. EMERGENCY WIP SAVE: If the Developer is 'BLOCKED' and DevOps has not saved the code yet: Route to 'DevOps' for an emergency WIP commit.\n"
+        "4. SLEEP (WIP SAVED): If DevOps just reported pushing a 'WIP BLOCKED PR', the code is safely saved.  Use `update_linear_ticket` to relay the exact instructions/blocker to the human, then Route to 'FINISH' to sleep until the human acts.\n"
+        "5. FINALIZING CODE: If the Developer's status is 'COMPLETE', route to 'DevOps' to push the final code and create a production Pull Request.\n"
+        "6. SLEEP (PROJECT DONE): If DevOps has created the final Pull Request, use `update_linear_ticket` to notify the human of success, then route to 'FINISH'.\n"
+        "7. STANDARD BUILD: If none of the above apply, and the core feature still needs to be built or is 'IN_PROGRESS', route to the 'Developer'.\n"
+    ))
+
+    # ---------------------------------------------------------
+    # MINIMAL API-MANDATED HISTORY FOR THE MANAGER
+    # The Manager relies entirely on the Work Log in the System Prompt.
+    # It only needs to see conversational history if it is mid-tool-execution
+    # (e.g., it just updated the ticket and now needs to route).
+    # ---------------------------------------------------------
+    minimal_history = []
+    
+    # We scan backwards to grab ONLY the immediate preceding tool block
+    for msg in reversed(messages):
+        msg_type = getattr(msg, "type", "")
+        msg_name = getattr(msg, "name", "")
+        
+        if msg_type == "tool":
+            # Keep tool responses at the end of the chain
+            minimal_history.insert(0, msg)
+            
+        elif msg_type == "ai" and msg_name == "Manager" and hasattr(msg, "tool_calls") and msg.tool_calls:
+            # We found the Manager's active tool call that triggered the tools above.
+            # Keep it so the API resolves the chain, and STOP looking backwards!
+            minimal_history.insert(0, msg)
+            break 
+            
+        else:
+            # The second we hit a Human message, a Broadcast, or a Developer message, 
+            # we break. The Manager doesn't need to see them; they are in the System Prompt.
+            break
+
+    # ---------------------------------------------------------
+    # Fetch the Manager's own native history (its past tool calls)
+    # isolated_history = filter_agent_history(state["messages"], agent_role="Manager")
+    # print(isolated_history)
+    # ---------------------------------------------------------
+    
+    # Add a simple Human message to trigger the Gemini API
+    human_trigger = HumanMessage(content="Please review the project state and make your routing decision or update the ticket.")
+
+    # Invoke the Manager with both the system instructions and the human trigger
+    # print(f"Invoking Manager with System Prompt:\n{system_prompt}\n\nIsolated History:\n{isolated_history}\n\nHuman Trigger:\n{human_trigger}")
+    # response = manager_llm.invoke([system_prompt] + isolated_history + [human_trigger])
+
+    print(f"Invoking Manager with System Prompt:\n{system_prompt}\n\nMinimal History:\n{minimal_history}\n\nHuman Trigger:\n{human_trigger}")
+    response = manager_llm.invoke([system_prompt] + minimal_history + [human_trigger])
+    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="Manager")
+    return {"messages": [response]}
+
+def manager_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
+    """Executes tools for the Manager and updates the global state."""
+    
+    # Scan backwards to find the AI message that requested the tools
+    messages = state.get("messages", [])
+    last_ai_msg = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
+    
+    messages_to_add = []
+    updates = {"messages": messages_to_add}
+    
+    if last_ai_msg and hasattr(last_ai_msg, "tool_calls") and last_ai_msg.tool_calls:
+        for tool in last_ai_msg.tool_calls:
+            
             if tool["name"] == "update_linear_ticket":
                 result = update_linear_ticket.invoke(tool["args"])
-                messages_to_add.append(ToolMessage(content=str(result), name=tool["name"], tool_call_id=tool["id"]))
-            else:
-                # Catch-all for hallucinated tools
-                messages_to_add.append(ToolMessage(content=f"Error: Tool '{tool['name']}' does not exist.", name=tool["name"], tool_call_id=tool["id"]))
+                messages_to_add.append(ToolMessage(
+                    content=str(result), 
+                    name=tool["name"], 
+                    tool_call_id=tool["id"]
+                ))
+                    
+            elif tool["name"] == "RouteDecision":
+                next_agent = tool["args"].get("next_agent", "FINISH")
+                reasoning = tool["args"].get("reasoning", "No reasoning provided.")
+                # print(f"\n[Intelligent Manager Routing]: {next_agent}\nReasoning: {reasoning}\n")
                 
-    return {"messages": messages_to_add, "next_agent": next_agent}
+                # Add the ToolMessage to satisfy the LLM API
+                messages_to_add.append(ToolMessage(
+                    content=f"Successfully routed to {next_agent}", 
+                    name=tool["name"], 
+                    tool_call_id=tool["id"]
+                ))
+
+                # Add the HumanMessage so downstream agents can see the direction
+                routing_msg = HumanMessage(
+                    content=f"MANAGER DIRECTION: Routing to {next_agent}. Reason: {reasoning}",
+                    name="Manager"
+                )
+                messages_to_add.append(routing_msg)
+                
+                # We update the state dictionary here!
+                updates["next_agent"] = next_agent
+                
+                # If routing to a worker, ensure they wake up in the correct status
+                if next_agent in ["Developer", "DevOps"]:
+                    updates["current_status"] = "IN_PROGRESS"
+                    updates["dev_iteration_count"] = 0
+                    
+    return updates
 
 def developer_node(state: AgencyState) -> dict:
-    """The Worker: Interacts with the persistent repo, writes code, and runs tests."""
+    """The Worker's Brain: Analyzes state and decides the next tool to call, or finishes."""
     import time
     time.sleep(3) # Keeping the rate limit safety net
     
-    # Consistent approach: The AI relies entirely on the E2B environment variables
+    # Fetch the existing state so we don't accidentally erase it!
+    current_phase = state.get("current_phase", "Implementation & Testing")
+    current_status = state.get("current_status", "IN_PROGRESS")
+    last_report = state.get("last_report", "")
+
+    # Dynamically generate the skills list
+    dynamic_skills = format_tool_descriptions(developer_tools)
+
+    # Dynamic Skill-Based Prompt
     system_prompt = SystemMessage(content=(
-        "You are a Senior Full-Stack Developer. You have access to a persistent cloud terminal. "
-        "Step 1: Use run_terminal_command to clone the GitHub repository using your environment variables: "
-        "`git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git` "
-        "Step 2: Explore the repository using terminal commands or the read_file tool. "
-        "Step 3: Modify or create the necessary files using the write_file tool. "
-        "Step 4: Run the test suite or execute the code using run_terminal_command to verify your changes. "
-        "Do not route back to the manager until you have verified the code works perfectly."
+        "You are a Senior Full-Stack Developer.\n\n"
+        
+        f"AVAILABLE SKILLS:\n{dynamic_skills}\n\n"
+
+        "PROCESS PHASE: Implementation & Testing. In this phase, you follow this lifecycle:\n"
+        "1. Environment Initialization: Preparing the workspace and cloning the repo.\n"
+        "2. Codebase Exploration: Understanding existing patterns and architecture.\n"
+        "3. Implementation: Writing clean, modular, and functional code.\n"
+        "4. Verification: Running tests and executing code to ensure zero regressions.\n\n"
+
+        "PROCESS-TO-SKILL MAPPING:\n"
+        "- Initialization/Verification: Use `run_terminal_command` for git, pytest, and execution.\n"
+        "- Exploration: Use `read_file` to examine code logic.\n"
+        "- Implementation: Use `write_file` to create or modify code.\n"
+        "- Backup/Saving: Use `sync_wip_commit` to save your progress remotely.\n\n"
+
+        "YOUR INSTRUCTIONS:\n"
+        "1. Work through the process step-by-step. After every tool call, analyze the output before deciding your next move. You can call `write_file` and immediately call `sync_wip_commit` in the exact same response to save time.\n"
+        #"1. Work through the process intelligently. You are encouraged to BATCH multiple tool calls in a single turn whenever possible to save time. For example, you can call `write_file` and immediately call `sync_wip_commit` in the exact same response.\n"
+        "2. Initialization: If the repository isn't cloned yet, clone it using: `git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git`. Use `cd <folder_name>` to enter the repository before running git commands or modifying files.\n"
+        "3. Exploration: Do NOT guess file paths; use `run_terminal_command` with `ls -R` to explore first.\n"
+        "4. Progress Evaluation & Completion: You must intelligently evaluate your progress against the original request. You MUST call the `ReportStatus` tool to yield control back to the Manager, selecting ONE of the following three states:\n\n"
+    
+        "4.1. STATE: 'COMPLETE'\n"
+        "   - Use this ONLY when the core feature is 100 percent built, fully tested, and utilizes real data.\n"
+        "   - If you left ANY placeholders, used mock data, or require the human to do anything, do not use the 'COMPLETE' status.\n\n"
+        
+        "4.2. STATE: 'IN_PROGRESS'\n"
+        "   - Use this if you have successfully completed a chunk of the task, but the overall feature is not finished yet, and you are NOT blocked.\n"
+        "   - Example: You built the HTML/CSS successfully and want to log your progress before starting the complex API logic.\n\n"
+    
+        "4.3. STATE: 'BLOCKED' (Human-in-the-Loop)\n"
+        "   - You are operating in a restricted sandbox to build a Production App. Use this immediately if your solution requires external API keys, database credentials, or bypasses network blocks. DO NOT fake the implementation with mock data.\n"
+        "   - Step A: Leave highly detailed placeholders in your code. Provide exact, step-by-step instructions for the human inside the comments (e.g., `// TODO: HUMAN ACTION REQUIRED \n // Step 1: Add API key here. \n // Step 2: Uncomment this fetch block.`).\n"
+        "   - Step B: Call `ReportStatus(status='BLOCKED')`. In the `thought` parameter, state the exact file name, line number, and repeat your step-by-step instructions so the Manager can add them to the Linear ticket.\n\n"
+        
+        "5. DO NOT attempt to use `git commit` or `git push` yourself via the terminal under any circumstances. If you need to save your progress, you MUST use the dedicated `sync_wip_commit` tool. You must call `sync_wip_commit` regularly after every major `write_file` operation or significant codebase change to ensure your progress is continuously backed up.\n"
+        "6. IMPORTANT: `ReportStatus` is a handoff tool which must be called in a separate, final turn. DO NOT call `ReportStatus` in the same turn as any other tool.\n\n"
+        
+        "RESUMING WORK (AFTER Human-in-the-Loop or Crash):\n"
+        "If the Manager routes a task back to you or overrides your system state with an active branch:\n"
+        "1. DO NOT start from scratch on the `main` branch.\n"
+        "2. Always check your instructions and run `git checkout <branch-name>` so you pull down the code you or the human just fixed.\n"
+        "3. Intelligently assess your progress and continue working on the original ticket. If you hit a new roadblock, fall back to the Human-in-the-Loop protocol and ask the human for help. If the feature is ready for a Pull Request, report COMPLETE.\n"
+
+        "RULES FOR TESTING:\n"
+        "1. If a terminal command returns 'context deadline exceeded' or 'timeout', it means you ran a persistent/blocking process (like a web server) in the background without proper detachment. You must kill the process and use short-lived test scripts instead.\n"
+        "2. To test a web server, use the 'Start, Curl, Kill' pattern in a SINGLE terminal command. Use `$!` to securely kill ONLY the background server you just started.\n"
+        "3. Always ensure ports are freed immediately after testing so you don't get 'Address already in use' errors.\n"
+        "4. To test logic, write a quick Python/Node test script, run it, and read the output.\n"
     ))
     
-    response = developer_llm.invoke([system_prompt] + state["messages"])
-    
-    # Prevent Gemini from crashing on empty strings
-    if not response.content or response.content.strip() == "":
-        response.content = "[Agent executing action]"
-        
-    # Bulletproof the state
-    if isinstance(response.content, list):
-        extracted_text = ""
-        for item in response.content:
-            if isinstance(item, dict) and "text" in item:
-                extracted_text += item["text"]
-            elif isinstance(item, str):
-                extracted_text += item
-        response.content = extracted_text
-        
+    # Strip out Manager and DevOps messages so the Developer only sees its own history
+    isolated_history = filter_agent_history(state["messages"], agent_role="Developer")
+
+    # Gemini Crash Failsafe: Ensure there is at least one User message
+    has_user_msg = any(getattr(m, "type", "") == "human" or isinstance(m, HumanMessage) for m in isolated_history)
+    if not has_user_msg:
+        isolated_history.insert(0, HumanMessage(content="Please review the task and begin development."))
+
+    print(isolated_history)
+
+    # Invoke the LLM with the clean history
+    response = developer_llm.invoke([system_prompt] + isolated_history)
+    # Reconstruct as a clean AIMessage to ensure serializability
+    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="Developer")
+    return {"messages": [response]}
+
+    # Append the AI response, and POTENTIALLY a ToolMessage
     messages_to_add = [response]
     
-    # Map out the available tools so the agent can execute any of them dynamically
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        for tool in response.tool_calls:
+            # Interecept the Controller Tool
+            if tool["name"] == "ReportStatus":
+                current_phase = tool["args"].get("phase", current_phase)
+                current_status = tool["args"].get("status", current_status)
+                last_report = tool["args"].get("thought", last_report)
+                print(f"[Developer Status]: {current_status} - {last_report}")
+                
+                # Execute it inline
+                messages_to_add.append(ToolMessage(
+                    content="Status successfully logged in system state.",
+                    name=tool["name"],
+                    tool_call_id=tool["id"]
+                ))
+                
+    return {
+        "messages": messages_to_add,
+        "current_phase": current_phase,
+        "current_status": current_status,
+        "last_report": last_report
+    }
+
+def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
+    """The Worker's Hands: Executes the tools requested by the Developer Brain."""
+    
+    last_ai_msg = next((m for m in reversed(state["messages"]) if isinstance(m, AIMessage)), None)
+    messages_to_add = []
+    
+    # The Registry
     tool_map = {
         "run_terminal_command": run_terminal_command,
         "read_file": read_file,
-        "write_file": write_file
+        "write_file": write_file,
+        "sync_wip_commit": sync_wip_commit
     }
-    
-    if response.tool_calls:
-        for tool in response.tool_calls:
-            if tool["name"] in tool_map:
-                result = tool_map[tool["name"]].invoke(tool["args"])
-                messages_to_add.append(ToolMessage(content=str(result), name=tool["name"], tool_call_id=tool["id"]))
+
+    if hasattr(last_ai_msg, "tool_calls") and last_ai_msg.tool_calls:
+        for tool in last_ai_msg.tool_calls:
+            tool_name = tool["name"]
+            
+            # Dynamically execute actual tools
+            if tool_name in tool_map:
+                args = tool["args"].copy()
+                
+                try:
+                    result = tool_map[tool_name].invoke(args, config=config)
+                    messages_to_add.append(ToolMessage(
+                        content=str(result), 
+                        name=tool_name, 
+                        tool_call_id=tool["id"]
+                    ))
+                except Exception as e:
+                    messages_to_add.append(ToolMessage(
+                        content=f"Error executing {tool_name}: {str(e)}", 
+                        name=tool_name, 
+                        tool_call_id=tool["id"]
+                    ))
             else:
-                messages_to_add.append(ToolMessage(content=f"Error: Tool '{tool['name']}' does not exist.", name=tool["name"], tool_call_id=tool["id"]))
+                messages_to_add.append(ToolMessage(
+                    content=f"Error: Tool '{tool_name}' not found.", 
+                    name=tool_name, 
+                    tool_call_id=tool["id"]
+                ))
     
+    # Increment execution count to prevent infinite loops
     new_count = state.get("dev_iteration_count", 0) + 1
     return {"messages": messages_to_add, "dev_iteration_count": new_count}
 
 def devops_node(state: AgencyState) -> dict:
-    """The Delivery Agent: Handles Git operations and CI/CD triggers."""
+    """The DevOps Brain: Decides whether to call tools or report completion to the Manager."""
     import time
-    time.sleep(3) # Keeping the rate limit safety net
+    time.sleep(3) 
     
+    ticket_id = state.get("active_ticket_url", "UNKNOWN")
+    current_phase = state.get("current_phase", "Delivery & Integration")
+    current_status = state.get("current_status", "IN_PROGRESS")
+    last_report = state.get("last_report", "")
+
+    # Dynamically generate the skills list!
+    dynamic_skills = format_tool_descriptions(devops_tools)
+
+    # Dynamic Skill-Based Prompt
     system_prompt = SystemMessage(content=(
-        "You are a DevOps Engineer. The Developer has successfully modified and tested the code in the shared workspace. "
-        "Step 1: Identify the exact Linear Ticket ID from the conversation history (e.g., AI-5). "
-        "Step 2: Use the create_github_pr tool to commit all workspace changes and open a Pull Request. You MUST pass the Ticket ID to this tool. "
-        "Step 3: Once the PR is created, use the update_linear_ticket tool to post the GitHub PR URL back to the human manager."
+        "You are a DevOps Engineer.\n\n"
+        
+        f"AVAILABLE SKILLS:\n{dynamic_skills}\n\n"
+        
+        f"The Developer has modified code. The active Linear Ticket ID is: {ticket_id}.\n\n"
+        
+        "YOUR INSTRUCTIONS:\n"
+        "1. Read the Team Work Log to intelligently understand the current state.\n"
+        "2. IF DEVELOPER IS 'COMPLETE': Use the `create_github_pr` tool to commit the finished code, push it to origin, and open a standard Pull Request ready for production review.\n"
+        "3. IF DEVELOPER IS 'BLOCKED': Use the SAME `create_github_pr` tool to rescue the incomplete code from the ephemeral sandbox. The tool will automatically name the branch. Title the Pull Request 'WIP: Blocked awaiting human' so the human can easily review and fix the broken code.\n"
+        "4. Completion: When finished, call `DevOpsReport(status='COMPLETE', thought='[State whether you created a final PR or a WIP Blocked PR, include the GitHub URL, and specify the EXACT branch name used]]')` to hand control back to the Manager.\n"
+        "5. IMPORTANT: DO NOT use terminal commands or write code. Do NOT update the Linear ticket.\n"
     ))
-    
-    response = devops_llm.invoke([system_prompt] + state["messages"])
-    
-    # Prevent Gemini from crashing on empty strings
-    if not response.content or response.content.strip() == "":
-        response.content = "[Agent executing action]"
-        
-    # Bulletproof the state
-    if isinstance(response.content, list):
-        extracted_text = ""
-        for item in response.content:
-            if isinstance(item, dict) and "text" in item:
-                extracted_text += item["text"]
-            elif isinstance(item, str):
-                extracted_text += item
-        response.content = extracted_text
-        
+
+    isolated_history = filter_agent_history(state["messages"], agent_role="DevOps")
+    response = devops_llm.invoke([system_prompt] + isolated_history)
+    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="DevOps")
     messages_to_add = [response]
     
-    if response.tool_calls:
+    if hasattr(response, "tool_calls") and response.tool_calls:
         for tool in response.tool_calls:
-            if tool["name"] == "update_linear_ticket":
-                result = update_linear_ticket.invoke(tool["args"])
-                messages_to_add.append(ToolMessage(content=str(result), name=tool["name"], tool_call_id=tool["id"]))
-            elif tool["name"] == "create_github_pr":
-                result = create_github_pr.invoke(tool["args"])
-                messages_to_add.append(ToolMessage(content=str(result), name=tool["name"], tool_call_id=tool["id"]))
+            # Interecept the Controller Tool
+            if tool["name"] == "DevOpsReport":
+                current_status = tool["args"].get("status", current_status)
+                last_report = tool["args"].get("thought", last_report)
+                pr_url = tool["args"].get("pr_url", "")
+                # print(f"[DevOps Status]: {current_status} | PR: {pr_url}")
+                
+                # Execute it inline
+                messages_to_add.append(ToolMessage(
+                    content="Status successfully logged in system state.",
+                    name=tool["name"],
+                    tool_call_id=tool["id"]
+                ))
+
+                # ==========================================
+                # BROADCAST PROTOCOL (P2P COMMUNICATION)
+                # Agents emit a HumanMessage with name="Broadcast" to
+                # share important information globally across the team.
+                # This bypasses the History Filter and is visible in all context windows.
+                # ==========================================
+
+                # Add the HumanMessage to Broadcast to the Developer
+                messages_to_add.append(HumanMessage(
+                    content=f"DEVOPS BROADCAST: Code pushed. PR URL: {pr_url} | Notes: {last_report}",
+                    name="Broadcast"
+                ))
+    return {
+        "messages": messages_to_add,
+        "current_phase": current_phase,
+        "current_status": current_status,
+        "last_report": last_report
+    }
+
+def devops_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
+    """The DevOps Hands: Executes the actual PR tool."""
+    last_msg = state["messages"][-1]
+    messages_to_add = []
+    
+    # The Registry: Add any future DevOps tools here
+    tool_map = {
+        "create_github_pr": create_github_pr,
+    }
+    
+    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+        for tool in last_msg.tool_calls:
+            tool_name = tool["name"]
+            
+           # Dynamically execute actual tools
+            if tool_name in tool_map:
+                args = tool["args"].copy()
+                
+                try:
+                    result = tool_map[tool_name].invoke(args, config=config)
+                    messages_to_add.append(ToolMessage(
+                        content=str(result), 
+                        name=tool_name, 
+                        tool_call_id=tool["id"]
+                    ))
+                except Exception as e:
+                    messages_to_add.append(ToolMessage(
+                        content=f"Error executing {tool_name}: {str(e)}", 
+                        name=tool_name, 
+                        tool_call_id=tool["id"]
+                    ))
             else:
-                messages_to_add.append(ToolMessage(content=f"Error: Tool '{tool['name']}' does not exist.", name=tool["name"], tool_call_id=tool["id"]))
+                # Fallback if the model hallucinates a tool
+                messages_to_add.append(ToolMessage(
+                    content=f"Error: Tool '{tool_name}' not found in registry.", 
+                    name=tool_name, 
+                    tool_call_id=tool["id"]
+                ))
                 
     return {"messages": messages_to_add}
