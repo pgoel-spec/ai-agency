@@ -8,3 +8,4 @@ uvicorn[standard]
 gunicorn
 anthropic>=0.45.0
 langchain-google-genai>=2.0.0
+tenacity

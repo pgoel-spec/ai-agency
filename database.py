@@ -27,7 +27,14 @@ def log_activity(ticket_id, role, content, node_name=None, tool_name=None, is_er
     try:
         # If content is a list or dict (like tool args), convert to JSON string
         if isinstance(content, (dict, list)):
-            content = json.dumps(content)
+            def message_serializer(obj):
+                # LangChain messages have a .dict() method
+                if hasattr(obj, "dict"):
+                    return obj.dict()
+                # Fallback for any other non-serializable objects
+                return str(obj)
+            
+            content = json.dumps(content, default=message_serializer, ensure_ascii=False)
         
         with get_db_conn() as conn:
             conn.execute('''

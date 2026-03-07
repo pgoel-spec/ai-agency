@@ -52,7 +52,8 @@ def get_latest_pr(ticket_id: str) -> dict:
             if ticket_id.lower() in head_ref.lower():
                 return {
                     "name": head_ref,
-                    "timestamp": _parse_github_time(pr.get("updated_at"))
+                    "timestamp": _parse_github_time(pr.get("updated_at")),
+                    "url": pr.get("html_url")
                 }
     return None
 
@@ -64,8 +65,52 @@ def get_wip_branch(ticket_id: str) -> dict:
     if not github_token or not repo_full:
         return None
         
-    wip_name = f"wip-recovery-{ticket_id}"
-    url = f"https://api.github.com/repos/{repo_full}/branches/{wip_name}"
+    # --- You must define the headers before making the request ---
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    resp = requests.get(f"https://api.github.com/repos/{repo_full}/branches", headers=headers)
+    if resp.status_code != 200:
+        return None
+        
+    branches = resp.json()
+    
+    # Filter for WIP branches belonging to this ticket
+    wip_prefix = f"wip-recovery-{ticket_id}"
+    matching_branches = [b for b in branches if wip_prefix.lower() in b["name"].lower()]
+    
+    if not matching_branches:
+        return None
+        
+    best_branch = None
+    best_time = None
+    
+    # Fetch the commit dates to find the most recently updated WIP branch
+    for branch in matching_branches:
+        commit_url = branch.get("commit", {}).get("url")
+        if commit_url:
+            commit_resp = requests.get(commit_url, headers=headers)
+            if commit_resp.status_code == 200:
+                ts_str = commit_resp.json().get("commit", {}).get("author", {}).get("date")
+                if ts_str:
+                    branch_time = _parse_github_time(ts_str)
+                    if best_time is None or branch_time > best_time:
+                        best_time = branch_time
+                        best_branch = branch["name"]
+                        
+    if best_branch:
+        return {"name": best_branch, "timestamp": best_time}
+        
+    return None
+
+def get_main_branch_timestamp(repo_full: str, github_token: str):
+    """Fetches the timestamp of the latest commit on the main branch."""
+    if not github_token or not repo_full:
+        return None
+        
+    url = f"https://api.github.com/repos/{repo_full}/branches/main"
     headers = {
         "Authorization": f"Bearer {github_token}",
         "Accept": "application/vnd.github.v3+json"
@@ -74,36 +119,51 @@ def get_wip_branch(ticket_id: str) -> dict:
     resp = requests.get(url, headers=headers)
     if resp.status_code == 200:
         ts_str = resp.json().get("commit", {}).get("commit", {}).get("author", {}).get("date")
-        return {
-            "name": wip_name,
-            "timestamp": _parse_github_time(ts_str)
-        }
+        return _parse_github_time(ts_str)
     return None
 
 def get_best_resume_branch(ticket_id: str) -> dict:
     """
-    Compares the PR and WIP branches using their dedicated fetchers.
-    Returns the winning 'branch_name' and its 'type'.
+    Races main, open PRs, and WIP branches against each other.
+    Whichever was updated most recently wins.
     """
+    github_token = os.environ.get("GITHUB_TOKEN")
+    repo_full = os.environ.get("GITHUB_REPO")
+
     pr_info = get_latest_pr(ticket_id)
     wip_info = get_wip_branch(ticket_id)
+    main_ts = get_main_branch_timestamp(repo_full, github_token)
 
-    # Both exist: Compare timestamps
-    if pr_info and wip_info:
-        if wip_info["timestamp"] and pr_info["timestamp"] and wip_info["timestamp"] > pr_info["timestamp"]:
-            return {"branch_name": wip_info["name"], "type": "wip"}
-        return {"branch_name": pr_info["name"], "type": "pr"}
+    candidates = []
+    
+    # 1. Add main
+    if main_ts:
+        candidates.append({"type": "main", "branch_name": "main", "timestamp": main_ts})
         
-    # Only one exists
-    elif pr_info:
-        return {"branch_name": pr_info["name"], "type": "pr"}
-    elif wip_info:
-        return {"branch_name": wip_info["name"], "type": "wip"}
+    # 2. Add Open PR
+    if pr_info and pr_info["timestamp"]:
+        candidates.append({"type": "pr", "branch_name": pr_info["name"], "timestamp": pr_info["timestamp"]})
         
-    # Neither exists
-    return None
+    # 3. Add WIP
+    if wip_info and wip_info["timestamp"]:
+        candidates.append({"type": "wip", "branch_name": wip_info["name"], "timestamp": wip_info["timestamp"]})
 
-# Update tools to accept the workspace from the node runner
+    # If nothing exists, start fresh
+    if not candidates:
+        return None
+
+    # Sort all valid candidates by timestamp (Newest first)
+    candidates.sort(key=lambda x: x["timestamp"], reverse=True)
+    winner = candidates[0]
+
+    # If main is the newest, it means the PR was merged and the WIP is stale. 
+    # Returning None tells main.py to ignore overrides and start fresh!
+    if winner["type"] == "main":
+        return None
+        
+    # Otherwise, return the winning branch (PR or WIP)
+    return winner
+
 @tool(args_schema=TerminalInput)
 def run_terminal_command(command: str, config: RunnableConfig) -> str:
     """
@@ -248,7 +308,7 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
 
     if existing_pr:
         # PATH A: Update Existing PR
-        existing_branch = existing_pr["name"]
+        active_branch = config.get("configurable", {}).get("active_resume_branch")
         
         # We push the current working state (HEAD) directly to the PR branch.
         git_commands = f"""
@@ -256,25 +316,23 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
         git config --global user.email "ai@agency.dev"
         git config --global user.name "AI DevOps"
         
+        git checkout {active_branch}
         git add .
-        git commit -m "{commit_message}" || echo "nothing to commit"
-        
-        # Use the variable explicitly in the string construction
-        git push https://$GITHUB_TOKEN@github.com/{repo_full}.git HEAD:refs/heads/{existing_branch} --force
+        git commit -m "Update: {commit_message}" || echo "nothing to commit"
+        git push https://$GITHUB_TOKEN@github.com/{repo_full}.git HEAD:refs/heads/{active_branch} --force
         """
         
         try:
             execution = workspace.commands.run(git_commands, envs=tool_envs)
             if execution.error and "nothing to commit" not in execution.stdout:
                 return f"Git Push Error:\nSTDOUT: {execution.stdout}\nSTDERR: {execution.stderr}"
-            return f"Successfully updated the existing Pull Request on branch '{existing_branch}'!"
+            return f"Successfully updated the existing Pull Request on branch '{active_branch}'!"
         except Exception as e:
             return f"Git Execution failed: {str(e)}"
             
     else:
         # PATH B: Create New PR
-        timestamp = int(time.time())
-        new_branch = f"ai-feature-{ticket_id}-{timestamp}"
+        new_branch = config.get("configurable", {}).get("pr_branch")
         
         git_commands = f"""
         cd {repo_folder}
@@ -335,8 +393,7 @@ def sync_wip_commit(commit_message: str, config: RunnableConfig) -> str:
         return "Error: GITHUB_TOKEN or GITHUB_REPO environment variable is missing."
 
     # Standard temporary backup branch name
-    ticket_id = config.get("configurable", {}).get("thread_id", "unknown")
-    wip_branch = f"wip-recovery-{ticket_id}"
+    wip_branch = config.get("configurable", {}).get("wip_branch")
 
     # Extract repo folder
     repo_folder = repo_full.split("/")[-1].replace(".git", "")

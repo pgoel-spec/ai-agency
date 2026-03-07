@@ -9,7 +9,51 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 from langchain_core.runnables import RunnableConfig
 from .state import AgencyState, DEVELOPER_ITERATION_LIMIT
 from .tools import update_linear_ticket, create_github_pr, run_terminal_command, read_file, write_file, sync_wip_commit
-from database import get_logs_by_ticket
+from database import get_logs_by_ticket, log_activity
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    retry_if_result
+)
+# Import the specific LangChain Google error
+from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
+# Import the specific Google API errors to catch
+from google.api_core import exceptions as google_exceptions
+from datetime import datetime
+
+def get_short_time():
+    return datetime.now().strftime("%b %d, %H:%M")
+
+def is_retryable_error(exception):
+    """
+    Checks if the error is a 429 Resource Exhausted error.
+    This prevents retrying on fatal errors like safety filters or invalid arguments.
+    """
+    if isinstance(exception, ChatGoogleGenerativeAIError):
+        # Retry if '429' or 'RESOURCE_EXHAUSTED' is in the error message
+        return "429" in str(exception) or "RESOURCE_EXHAUSTED" in str(exception)
+    
+    # Also catch the raw Google exception if it ever bubbles up
+    if isinstance(exception, google_exceptions.ResourceExhausted):
+        return True
+        
+    return False
+
+# Define the smart retry strategy
+# wait_exponential(multiplier=1, min=4, max=60) means:
+# Wait 4s, 8s, 16s, 32s, then capped at 60s between retries.
+llm_retry_decorator = retry(
+    retry=retry_if_exception_type((ChatGoogleGenerativeAIError, google_exceptions.ResourceExhausted)),
+    wait=wait_exponential(multiplier=1, min=4, max=60), 
+    stop=stop_after_attempt(5),
+    before_sleep=lambda retry_state: print(f"Quota exhausted. Retrying in {retry_state.next_action.sleep} seconds...")
+)
+
+@llm_retry_decorator
+def safe_invoke_llm(llm, prompt_list):
+    return llm.invoke(prompt_list)
 
 # Define the Routing Schema
 class RouteDecision(BaseModel):
@@ -165,8 +209,9 @@ def filter_agent_history(messages: list, agent_role: str) -> list:
                 
         elif msg_type == "ai":
             # IDENTITY SHIELD: Prevent agents from stealing each other's text thoughts!
-            # if msg_name and msg_name.lower() not in [agent_role.lower(), "ai", ""]:
-            #    continue
+            msg_name = getattr(msg, "name", "")
+            if msg_name and msg_name.lower() not in [agent_role.lower(), "ai", ""]:
+               continue
             
             new_msg = msg.copy()
 
@@ -192,9 +237,24 @@ def filter_agent_history(messages: list, agent_role: str) -> list:
 def manager_node(state: AgencyState) -> dict:
     """The Supervisor: Routes tasks and updates Linear tickets based on team status."""
     
+    # Dynamic Registry (Keep your existing available_agents list)
+    # This can eventually move to a config file or database
+    available_agents = [
+        {
+            "role": "Developer",
+            "skills": get_tool_names(developer_tools),
+            "description": "Best for writing code, modifying files, and local testing."
+        },
+        {
+            "role": "DevOps",
+            "skills": get_tool_names(devops_tools),
+            "description": "Best for creating Pull Requests and pushing code to Git."
+        }
+    ]
+
     messages = state.get("messages", [])
     
-    # --- PRE-COMPUTE DEBUG CONTEXT ---
+    # 1. PRE-COMPUTE DEBUG CONTEXT
     dev_iterations = state.get("dev_iteration_count", 0)
     detailed_debug_context = ""
 
@@ -219,12 +279,77 @@ def manager_node(state: AgencyState) -> dict:
         except Exception as e:
             detailed_debug_context = f"\n[SYSTEM ERROR]: Failed to retrieve debug logs: {str(e)}"
 
-    # --- TEAM WORK LOG: Build a clean, chronological log from the team's reports ---
+    # 2. Safely Extract the Original Client Request (handles both tuples and Message objects)
+    original_task_raw = "No task provided."
+    if messages:
+        first_msg = messages[0]
+        if isinstance(first_msg, tuple):
+            original_task_raw = first_msg[1] # Extract the string from ("user", "string")
+        else:
+            original_task_raw = first_msg.content # Extract from an actual AIMessage/HumanMessage
+
+    # Clean the original task to separate the request from the backend override
+    original_task = original_task_raw.split("SYSTEM OVERRIDE")[0].strip()
+
+    # 3. Extract the Active System Override (The Branch/PR instruction)
+    active_system_override = "No specific override provided."
+    for msg in reversed(messages):
+        msg_content = msg[1] if isinstance(msg, tuple) else getattr(msg, "content", "")
+        if "SYSTEM OVERRIDE" in msg_content:
+            # Grab everything after the phrase "SYSTEM OVERRIDE:"
+            parts = msg_content.split("SYSTEM OVERRIDE")
+            if len(parts) > 1:
+                active_system_override = parts[1].strip()
+            break
+    
+    # 4. DETECT HUMAN RESUME (Safe from tool loops & original task)
+    is_human_resume = False
+    
+    if len(messages) > 1:
+        for msg in reversed(messages[1:]):
+            msg_type = getattr(msg, "type", "") if not isinstance(msg, tuple) else msg[0]
+            msg_name = getattr(msg, "name", "") if not isinstance(msg, tuple) else ""
+            
+            # Skip the Manager's own internal thoughts/tools
+            if msg_name == "Manager" or msg_type == "tool" or (msg_type == "ai" and msg_name == "Manager"):
+                continue 
+                
+            # If the first major actor we hit is a human, it's a resume!
+            if msg_type in ["human", "user"]:
+                is_human_resume = True
+                break
+                
+            # If we hit the Developer or DevOps, the AI is still working
+            if msg_type == "ai":
+                break
+
+    # 5. TEAM WORK LOG
+    # Build a clean, chronological log from the team's reports (SKIPPING the first message)
     work_log_entries = []
     is_blocked = False # Flag to check if we need human help
-    
-    for msg in messages:
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
+
+    for msg in messages[1:]:
+        msg_type = getattr(msg, "type", "") if not isinstance(msg, tuple) else msg[0]
+        kwargs = getattr(msg, "additional_kwargs", {})
+        
+        # Safely grab the timestamp if it is implemented
+        time_stamp = kwargs.get("timestamp", "")
+        time_prefix = f"[{time_stamp}] " if time_stamp else ""
+
+        # Capture Human Interventions
+        if msg_type in ["human", "user"]:
+            # Ignore our internal routing messages (which use name="Manager")
+            if getattr(msg, "name", "") != "Manager":
+                content = getattr(msg, "content", "") if not isinstance(msg, tuple) else msg[1]
+                
+                # Strip the noisy override text from the timeline
+                clean_content = content.split("SYSTEM OVERRIDE")[0].strip()
+                
+                if clean_content:
+                    work_log_entries.append(f"{time_prefix} [HUMAN UPDATE]: {clean_content}")
+
+        # Capture Agent Reports chronologically
+        elif hasattr(msg, "tool_calls") and msg.tool_calls:
             for tool in msg.tool_calls:
                 if tool["name"] in ["ReportStatus", "DevOpsReport"]:
                     status = tool["args"].get("status", "UNKNOWN")
@@ -232,96 +357,44 @@ def manager_node(state: AgencyState) -> dict:
                     role = "Developer" if tool["name"] == "ReportStatus" else "DevOps"
                     
                     if status == "COMPLETE":
-                        work_log_entries.append(f"[{role} - {status}]: {thought}")
+                        work_log_entries.append(f"{time_prefix} [{role} - {status}]: {thought}")
                     elif status == "BLOCKED":
                         is_blocked = True
-                        work_log_entries.append(f"[{role} - BLOCKED]: {thought}")
+                        work_log_entries.append(f"{time_prefix} [{role} - BLOCKED]: {thought}")
 
-    work_log_str = "\n".join(work_log_entries) if work_log_entries else "No work has been completed yet."
+    numbered_log = [f"Step {i+1}: {entry}" for i, entry in enumerate(work_log_entries)]
+    work_log_str = "\n".join(numbered_log) if numbered_log else "No work has been completed yet."
     # print(work_log_str)
 
-    # 1. Safely Extract the Original Client Request (handles both tuples and Message objects)
-    original_task = "No task provided."
-    if messages:
-        first_msg = messages[0]
-        if isinstance(first_msg, tuple):
-            original_task = first_msg[1] # Extract the string from ("user", "string")
-        else:
-            original_task = first_msg.content # Extract from an actual AIMessage/HumanMessage
-
-    # 2. We look for the MOST RECENT message that contains "SYSTEM OVERRIDE"
-    current_run_instruction = "No specific override provided."
-    for msg in reversed(messages):
-        content = msg[1] if isinstance(msg, tuple) else getattr(msg, "content", "")
-        if "SYSTEM OVERRIDE" in content:
-            current_run_instruction = content
-            break
-
-    # 3. Correctly isolate ACTUAL recent human updates
-    real_human_messages = []
-    for msg in messages:
-        # Safely extract type and name
-        msg_type = msg[0] if isinstance(msg, tuple) else getattr(msg, "type", "")
-        msg_name = "" if isinstance(msg, tuple) else getattr(msg, "name", "")
-        
-        # Ignore our internal routing messages (which use name="Manager")
-        if msg_type in ["human", "user"] and msg_name != "Manager":
-            msg_content = msg[1] if isinstance(msg, tuple) else getattr(msg, "content", "")
-            real_human_messages.append(msg_content)
-
-    # 4. Detect a Human Resume and Extract the Latest Update
-    is_human_resume = False
-    latest_human_update = "No recent updates from human."
-    if len(real_human_messages) > 1:
-        # Only treat it as an update if the content differs from the original task
-        if real_human_messages[-1].strip() != original_task.strip():
-            is_human_resume = True
-            latest_human_update = real_human_messages[-1]
-
-    # Extract the current active status to see if someone was interrupted
+    # 6. Add a fallback warning so the Manager knows if the Developer hit a timeout
     current_status = state.get("current_status", "NOT_STARTED")
     
-    # Add a fallback warning so the Manager knows if the Developer hit a timeout
     status_warning = ""
     if current_status == "IN_PROGRESS" and not is_blocked:
         status_warning = "\n[SYSTEM WARNING]: The Developer was working but hit an iteration limit or timeout before calling ReportStatus. They are currently IN_PROGRESS. Route back to them so they can finish the job.\n"
 
-    # Dynamic Registry (Keep your existing available_agents list)
-    # This can eventually move to a config file or database
-    available_agents = [
-        {
-            "role": "Developer",
-            "skills": get_tool_names(developer_tools),
-            "description": "Best for writing code, modifying files, and local testing."
-        },
-        {
-            "role": "DevOps",
-            "skills": get_tool_names(devops_tools),
-            "description": "Best for creating Pull Requests and pushing code to Git."
-        }
-    ]
-
-    # The Intelligent Prompt
+    # 7. The Intelligent Prompt
     system_prompt = SystemMessage(content=(
         f"You are an intelligent Engineering Manager coordinating an AI team.\n\n"
         f"TEAM REGISTRY:\n{json.dumps(available_agents, indent=2)}\n\n"
         
         f"--- ORIGINAL CLIENT REQUEST ---\n"
         f"{original_task}\n\n"
-
-        f"--- LATEST UPDATE FROM HUMAN ---\n"
-        f"{latest_human_update}\n\n" # This ensures the manager sees your resume instructions
         
-        f"--- TEAM WORK LOG (History of Accomplishments) ---\n"
+        f"--- ACTIVE SYSTEM STATUS ---\n"
+        f"SYSTEM OVERRIDE: {active_system_override}\n\n"
+
+        f"--- TEAM WORK LOG ---\n"
         f"{work_log_str}\n"
         f"{status_warning}\n" # Reset dev_iteration_count if this is uncommented to prevent infinite loops
         f"{detailed_debug_context}\n"
         f"--------------------------------------------------\n\n"
         
         "YOUR CORE RESPONSIBILITIES:\n"
-        "1. Read the Original Client Request and compare it against the Team Work Log.\n"
-        "2. If the [CRITICAL AUDIT] block is present, perform a deep-dive analysis of the raw logs to unblock the developer.\n"
-        "3. Intelligently deduce the current state of the project and what needs to happen next.\n\n"
+        "1. Read the Team Work Log from top to bottom. This is a chronological log and the last step is the current state of the project.\n"
+        "2. Read the Original Client Request and compare it against the Team Work Log.\n"
+        "3. If the [CRITICAL AUDIT] block is present, perform a deep-dive analysis of the raw logs to unblock the developer.\n"
+        "4. Intelligently deduce the current state of the project and what needs to happen next.\n\n"
 
         "ROUTING RULES (Evaluate from top to bottom):\n"
         "1. TIMEOUT RECOVERY: If you see a [SYSTEM WARNING] that the Developer hit a timeout, route back to the 'Developer' immediately so they can finish their thought.\n"
@@ -374,9 +447,19 @@ def manager_node(state: AgencyState) -> dict:
     # print(f"Invoking Manager with System Prompt:\n{system_prompt}\n\nIsolated History:\n{isolated_history}\n\nHuman Trigger:\n{human_trigger}")
     # response = manager_llm.invoke([system_prompt] + isolated_history + [human_trigger])
 
-    print(f"Invoking Manager with System Prompt:\n{system_prompt}\n\nMinimal History:\n{minimal_history}\n\nHuman Trigger:\n{human_trigger}")
-    response = manager_llm.invoke([system_prompt] + minimal_history + [human_trigger])
-    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="Manager")
+    # Construct the full prompt list
+    full_prompt = [system_prompt] + minimal_history + [human_trigger]
+
+    # Exhaustive Log: Log the exact prompt being sent to the LLM 
+    log_activity(
+        ticket_id=state.get("active_ticket_url", "UNKNOWN"),
+        role="ai_prompt",
+        content=full_prompt,
+        node_name="Manager"
+    )
+    
+    response = safe_invoke_llm(manager_llm, full_prompt)
+    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="Manager", additional_kwargs={"timestamp": get_short_time()})
     return {"messages": [response]}
 
 def manager_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
@@ -415,7 +498,8 @@ def manager_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
                 # Add the HumanMessage so downstream agents can see the direction
                 routing_msg = HumanMessage(
                     content=f"MANAGER DIRECTION: Routing to {next_agent}. Reason: {reasoning}",
-                    name="Manager"
+                    name="Manager",
+                    additional_kwargs={"timestamp": get_short_time()}
                 )
                 messages_to_add.append(routing_msg)
                 
@@ -483,6 +567,17 @@ def developer_node(state: AgencyState) -> dict:
         "5. DO NOT attempt to use `git commit` or `git push` yourself via the terminal under any circumstances. If you need to save your progress, you MUST use the dedicated `sync_wip_commit` tool. You must call `sync_wip_commit` regularly after every major `write_file` operation or significant codebase change to ensure your progress is continuously backed up.\n"
         "6. IMPORTANT: `ReportStatus` is a handoff tool which must be called in a separate, final turn. DO NOT call `ReportStatus` in the same turn as any other tool.\n\n"
         
+        "DESIGN STANDARDS:\n"
+        "- When writing frontend code, you MUST create highly polished, modern, and 'slick' user interfaces.\n"
+        "- Do not use basic vanilla CSS unless absolutely necessary. By default, import Tailwind CSS via CDN (`<script src=\"https://cdn.tailwindcss.com\"></script>`) for rapid, modern styling.\n"
+        "- Ensure all interfaces are fully responsive (mobile-first), use modern typography (e.g., Inter or Roboto via Google Fonts), incorporate soft shadows, rounded corners (`rounded-lg`), and proper whitespace (`gap`, `p-`, `m-`).\n"
+        "- Add subtle hover states and CSS transitions to make the UI feel interactive.\n\n"
+
+        "DIRECTORY & FIREBASE RULES:\n"
+        "1. NEVER move, create, or modify `firebase.json` or `.firebaserc` inside a subfolder (like `public`, `src`, or `dist`).\n"
+        "2. Firebase configuration files MUST always remain at the absolute root of the repository.\n"
+        "3. Only place your actual frontend code (HTML, CSS, JS) inside the `public` directory. Make sure `firebase.json` points its hosting 'public' key to this folder.\n\n"
+
         "RESUMING WORK (AFTER Human-in-the-Loop or Crash):\n"
         "If the Manager routes a task back to you or overrides your system state with an active branch:\n"
         "1. DO NOT start from scratch on the `main` branch.\n"
@@ -504,13 +599,20 @@ def developer_node(state: AgencyState) -> dict:
     if not has_user_msg:
         isolated_history.insert(0, HumanMessage(content="Please review the task and begin development."))
 
-    print(isolated_history)
+    # Construct the full prompt list
+    full_prompt = [system_prompt] + isolated_history
+    
+    # Exhaustive Log: Log the exact prompt being sent to the LLM 
+    log_activity(
+        ticket_id=state.get("active_ticket_url", "UNKNOWN"),
+        role="ai_prompt",
+        content=full_prompt,
+        node_name="Developer"
+    )
 
-    # Invoke the LLM with the clean history
-    response = developer_llm.invoke([system_prompt] + isolated_history)
+    response = safe_invoke_llm(developer_llm, full_prompt)
     # Reconstruct as a clean AIMessage to ensure serializability
-    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="Developer")
-    return {"messages": [response]}
+    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="Developer", additional_kwargs={"timestamp": get_short_time()})
 
     # Append the AI response, and POTENTIALLY a ToolMessage
     messages_to_add = [response]
@@ -609,13 +711,24 @@ def devops_node(state: AgencyState) -> dict:
         "1. Read the Team Work Log to intelligently understand the current state.\n"
         "2. IF DEVELOPER IS 'COMPLETE': Use the `create_github_pr` tool to commit the finished code, push it to origin, and open a standard Pull Request ready for production review.\n"
         "3. IF DEVELOPER IS 'BLOCKED': Use the SAME `create_github_pr` tool to rescue the incomplete code from the ephemeral sandbox. The tool will automatically name the branch. Title the Pull Request 'WIP: Blocked awaiting human' so the human can easily review and fix the broken code.\n"
-        "4. Completion: When finished, call `DevOpsReport(status='COMPLETE', thought='[State whether you created a final PR or a WIP Blocked PR, include the GitHub URL, and specify the EXACT branch name used]]')` to hand control back to the Manager.\n"
+        "4. Completion: When finished, call `DevOpsReport(status='COMPLETE', thought='[State whether you created a final PR or a WIP Blocked PR, include the GitHub URL, and specify the EXACT branch name used]', pr_url='<INSERT URL HERE>')` to hand control back to the Manager.\n"
         "5. IMPORTANT: DO NOT use terminal commands or write code. Do NOT update the Linear ticket.\n"
     ))
 
     isolated_history = filter_agent_history(state["messages"], agent_role="DevOps")
-    response = devops_llm.invoke([system_prompt] + isolated_history)
-    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="DevOps")
+    # Construct the full prompt list
+    full_prompt = [system_prompt] + isolated_history
+    
+    # Exhaustive Log: Log the exact prompt being sent to the LLM 
+    log_activity(
+        ticket_id=state.get("active_ticket_url", "UNKNOWN"),
+        role="ai_prompt",
+        content=full_prompt,
+        node_name="DevOps"
+    )
+
+    response = safe_invoke_llm(devops_llm, full_prompt)
+    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="DevOps", additional_kwargs={"timestamp": get_short_time()})
     messages_to_add = [response]
     
     if hasattr(response, "tool_calls") and response.tool_calls:
@@ -644,7 +757,8 @@ def devops_node(state: AgencyState) -> dict:
                 # Add the HumanMessage to Broadcast to the Developer
                 messages_to_add.append(HumanMessage(
                     content=f"DEVOPS BROADCAST: Code pushed. PR URL: {pr_url} | Notes: {last_report}",
-                    name="Broadcast"
+                    name="Broadcast",
+                    additional_kwargs={"timestamp": get_short_time()}
                 ))
     return {
         "messages": messages_to_add,

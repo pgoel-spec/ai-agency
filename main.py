@@ -7,6 +7,8 @@ from agents.tools import get_best_resume_branch
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from database import init_db, log_activity, get_db_conn
 from langchain_core.messages import HumanMessage
+from datetime import datetime
+import time
 
 active_tickets = set() # Global set to track currently processing tickets
 load_dotenv() # Load the .env file so the API keys are available to the tools
@@ -99,36 +101,36 @@ def process_ticket(ticket_id: str, human_input: str, has_history: bool):
                 
                 if "messages" in node_state and len(node_state["messages"]) > 0:
                     last_msg = node_state["messages"][-1]
-                    
-                    # --- STEP 2: Log the AI's response (Thought & Tools) ---
 
-                    # Log the "Thought" (The text content)
-                    if hasattr(last_msg, "content") and last_msg.content and last_msg.type != "tool":
+                    # --- EXHAUSTIVE AI LOGGING ---
+                    if last_msg.type == "ai":
+                        # 1. Log the Raw Message Object for maximum detail
+                        # This captures metadata, thought signatures, and usage stats
                         log_activity(
                             ticket_id=ticket_id,
-                            role=getattr(last_msg, "type", "ai"),
-                            content=last_msg.content, # This is the "Thought"
+                            role="ai_raw_response",
+                            content=last_msg.dict() if hasattr(last_msg, "dict") else str(last_msg),
                             node_name=node_name
                         )
 
-                    # 1. Log AI Tool Calls (The intent to act)
-                    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                        for tc in last_msg.tool_calls:
-                            log_activity(
-                                ticket_id=ticket_id,
-                                role="ai",
-                                content=tc["args"],
-                                node_name=node_name,
-                                tool_name=tc["name"]
-                            )
+                        # 2. Log Tool Calls (The intent to act)
+                        if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                            for tc in last_msg.tool_calls:
+                                log_activity(
+                                    ticket_id=ticket_id,
+                                    role="ai_tool_call",
+                                    content=tc["args"],
+                                    node_name=node_name,
+                                    tool_name=tc["name"]
+                                )
                     
                     # 2. Log Tool Outputs (The result of the action)
-                    elif hasattr(last_msg, "type") and last_msg.type == "tool":
+                    elif last_msg.type == "tool":
                         content_str = str(last_msg.content).lower()
                         is_err = any(word in content_str for word in ["error", "failed", "exception", "not found"])
                         log_activity(
                             ticket_id=ticket_id,
-                            role="tool",
+                            role="tool_output",
                             content=last_msg.content,
                             node_name=node_name,
                             tool_name=getattr(last_msg, "name", "unknown_tool"),
@@ -140,14 +142,24 @@ def process_ticket(ticket_id: str, human_input: str, has_history: bool):
     try:
         # Initial Log: Capture the starting human input
         log_activity(ticket_id, "human", human_input, node_name="Webhook")
-
         best_branch_info = get_best_resume_branch(ticket_id)
+        short_time = datetime.now().strftime("%b %d, %H:%M")
 
         if best_branch_info:
             branch_name = best_branch_info["branch_name"]
             branch_type = best_branch_info["type"]
 
             print(f"\n[SYSTEM]: Found '{branch_type}' branch at '{branch_name}'. Team will resume work from here.")
+
+            # --- Extract the Session ID from the branch name ---
+            # If the branch is 'wip-recovery-123-17000', the session_id is '123-17000'
+            session_id = branch_name.replace("wip-recovery-", "").replace("feature-", "")
+
+            # --- Update Config to use the Shared Memory ID ---
+            config["configurable"]["thread_id"] = session_id
+            config["configurable"]["wip_branch"] = f"wip-recovery-{session_id}"
+            config["configurable"]["pr_branch"] = f"feature-{session_id}"
+            config["configurable"]["active_resume_branch"] = branch_name # So we know what to checkout
 
             # Add system override based on the branch type
             if branch_type == "wip":
@@ -166,9 +178,13 @@ def process_ticket(ticket_id: str, human_input: str, has_history: bool):
             # Create a strictly typed and tagged HumanMessage
             webhook_msg = HumanMessage(
                 content=prompt,
-                name="Human", # You can call it whatever you want now
-                additional_kwargs={"source": "webhook"} # <--- THE MAGIC TAG
+                name="Human",
+                additional_kwargs={"source": "webhook", "timestamp": short_time}
             )
+
+            # --- Update Config and Check True History ---
+            current_state = agent_team.get_state(config)
+            has_history = bool(current_state.values)
 
             if has_history:
                 # --- WIP: CONTEXT REHYDRATION (Checking the Real World) ---
@@ -178,20 +194,38 @@ def process_ticket(ticket_id: str, human_input: str, has_history: bool):
             else:
                 # Start a new conversation, but force it to use the PR branch
                 initial_state = {
-                    "messages": [("user", prompt)],
+                    "messages": [webhook_msg],
                     "active_ticket_url": ticket_id,
                     "current_status": "NOT_STARTED",
                     "current_phase": "Planning"
                 }
                 stream_and_log(initial_state, config, ticket_id)
         else:
-            print(f"\n[SYSTEM]: No open PRs found. Dispatching team for new ticket {ticket_id}...")
+            print(f"\n[SYSTEM]: No active PR or WIP branches found ahead of main. Dispatching team for new ticket {ticket_id}...")
             
+            # --- Generate a shared Session ID ---
+            session_timestamp = int(time.time())
+            session_id = f"{ticket_id}-{session_timestamp}"
+
+            # --- Set up the shared config ---
+            config["configurable"]["thread_id"] = session_id
+            config["configurable"]["wip_branch"] = f"wip-recovery-{session_id}"
+            config["configurable"]["pr_branch"] = f"feature-{session_id}"
+            config["configurable"]["active_resume_branch"] = "main"
+
             # If there's no open PR, we start entirely from scratch.
             system_note = "\n\nSYSTEM OVERRIDE: You are in a completely new, empty E2B sandbox. There are no open PRs to resume from. Build the feature from scratch on a new branch."
             prompt = human_input + system_note
+            
+            # --- Create object so we don't lose timestamp ---
+            webhook_msg = HumanMessage(
+                content=prompt,
+                name="Human",
+                additional_kwargs={"source": "webhook", "timestamp": short_time}
+            )
+
             initial_state = {
-                "messages": [("user", prompt)],
+                "messages": [webhook_msg],
                 "active_ticket_url": ticket_id,
                 "current_status": "NOT_STARTED",
                 "current_phase": "Planning"
