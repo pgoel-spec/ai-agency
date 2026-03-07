@@ -398,12 +398,13 @@ def manager_node(state: AgencyState) -> dict:
 
         "ROUTING RULES (Evaluate from top to bottom):\n"
         "1. TIMEOUT RECOVERY: If you see a [SYSTEM WARNING] that the Developer hit a timeout, route back to the 'Developer' immediately so they can finish their thought.\n"
-        "2. RESUMING WORK: If the human just replied to a blocked ticket (meaning the blocker is resolved), route to the 'Developer' so they can resume work on the WIP branch even if the previous status was 'BLOCKED'.\n"
-        "3. EMERGENCY WIP SAVE: If the Developer is 'BLOCKED' and DevOps has not saved the code yet: Route to 'DevOps' for an emergency WIP commit.\n"
-        "4. SLEEP (WIP SAVED): If DevOps just reported pushing a 'WIP BLOCKED PR', the code is safely saved.  Use `update_linear_ticket` to relay the exact instructions/blocker to the human, then Route to 'FINISH' to sleep until the human acts.\n"
-        "5. FINALIZING CODE: If the Developer's status is 'COMPLETE', route to 'DevOps' to push the final code and create a production Pull Request.\n"
-        "6. SLEEP (PROJECT DONE): If DevOps has created the final Pull Request, use `update_linear_ticket` to notify the human of success, then route to 'FINISH'.\n"
-        "7. STANDARD BUILD: If none of the above apply, and the core feature still needs to be built or is 'IN_PROGRESS', route to the 'Developer'.\n"
+        "2. DISCOVERY & MAPPING: If the Developer is still exploring the file structure or reading core configuration files to build a 'System Map', route to 'Developer' to allow them to finish their architectural analysis.\n"
+        "3. RESUMING WORK: If the human just replied to a blocked ticket (meaning the blocker is resolved), route to the 'Developer' so they can resume work on the WIP branch even if the previous status was 'BLOCKED'.\n"
+        "4. EMERGENCY WIP SAVE: If the Developer is 'BLOCKED' and DevOps has not saved the code yet: Route to 'DevOps' for an emergency WIP commit.\n"
+        "5. SLEEP (WIP SAVED): If DevOps just reported pushing a 'WIP BLOCKED PR', the code is safely saved.  Use `update_linear_ticket` to relay the exact instructions/blocker to the human, then Route to 'FINISH' to sleep until the human acts.\n"
+        "6. FINALIZING CODE: If the Developer's status is 'COMPLETE', route to 'DevOps' to push the final code and create a production Pull Request.\n"
+        "7. SLEEP (PROJECT DONE): If DevOps has created the final Pull Request, use `update_linear_ticket` to notify the human of success, then route to 'FINISH'.\n"
+        "8. STANDARD BUILD: If none of the above apply, and the core feature still needs to be built or is 'IN_PROGRESS', route to the 'Developer'.\n"
     ))
 
     # ---------------------------------------------------------
@@ -548,9 +549,13 @@ def developer_node(state: AgencyState) -> dict:
         "1. Work through the process step-by-step. After every tool call, analyze the output before deciding your next move. You can call `write_file` and immediately call `sync_wip_commit` in the exact same response to save time.\n"
         #"1. Work through the process intelligently. You are encouraged to BATCH multiple tool calls in a single turn whenever possible to save time. For example, you can call `write_file` and immediately call `sync_wip_commit` in the exact same response.\n"
         "2. Initialization: If the repository isn't cloned yet, clone it using: `git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git`. Use `cd <folder_name>` to enter the repository before running git commands or modifying files.\n"
-        "3. Exploration: Do NOT guess file paths; use `run_terminal_command` with `ls -R` to explore first.\n"
-        "4. Progress Evaluation & Completion: You must intelligently evaluate your progress against the original request. You MUST call the `ReportStatus` tool to yield control back to the Manager, selecting ONE of the following three states:\n\n"
-    
+        "3. Codebase Exploration: Do NOT guess file paths. Your first priority is to build a 'System Map':\n"
+        "   - Run `ls -R` to understand the full directory hierarchy.\n"
+        "   - Identify and read the 'Source of Truth' files: Look for dependency manifests (e.g., package.json, requirements.txt, pyproject.toml) and core schemas or state definitions.\n"
+        "   - Locate the main Entry Points (e.g., main.py, index.js, app.py, or Dockerfiles) to understand the execution flow.\n"
+        "   - Use this information to create a mental map of the architecture before modifying any code. This ensures you respect existing design patterns and folder structures.\n"
+        
+        "4. Progress Evaluation & Completion: You must intelligently evaluate your progress against the original request. You MUST call the `ReportStatus` tool to yield control back to the Manager, selecting ONE of the following three states:\n"
         "4.1. STATE: 'COMPLETE'\n"
         "   - Use this ONLY when the core feature is 100 percent built, fully tested, and utilizes real data.\n"
         "   - If you left ANY placeholders, used mock data, or require the human to do anything, do not use the 'COMPLETE' status.\n\n"
@@ -585,10 +590,13 @@ def developer_node(state: AgencyState) -> dict:
         "3. Intelligently assess your progress and continue working on the original ticket. If you hit a new roadblock, fall back to the Human-in-the-Loop protocol and ask the human for help. If the feature is ready for a Pull Request, report COMPLETE.\n"
 
         "RULES FOR TESTING:\n"
-        "1. If a terminal command returns 'context deadline exceeded' or 'timeout', it means you ran a persistent/blocking process (like a web server) in the background without proper detachment. You must kill the process and use short-lived test scripts instead.\n"
-        "2. To test a web server, use the 'Start, Curl, Kill' pattern in a SINGLE terminal command. Use `$!` to securely kill ONLY the background server you just started.\n"
-        "3. Always ensure ports are freed immediately after testing so you don't get 'Address already in use' errors.\n"
-        "4. To test logic, write a quick Python/Node test script, run it, and read the output.\n"
+        "1. RESTRICTED ENVIRONMENT: You do not have root/sudo access. NEVER use 'sudo' or the '-g' (global) flag with npm or pip or try to modify system directories like `/usr/lib/`. This will cause errors.\n"
+        "2. To execute CLI tools (like firebase, tsc, or next), you MUST use 'npx' (e.g., 'npx firebase deploy') to ensure the local version is used.\n"
+        "3. If a terminal command returns 'context deadline exceeded' or 'timeout', it means you ran a persistent/blocking process (like a web server) in the background without proper detachment. You must kill the process and use short-lived test scripts instead.\n"
+        "4. EMULATOR WORKAROUND: If the Firebase Emulator fails to bind to ports, do not retry. Instead, create a standalone Node.js test script that imports your Express app/functions. Use a library like 'supertest' (if available) or mock the Request/Response objects manually to verify logic without a live network server.\n"
+        "5. To test a web server, use the 'Start, Curl, Kill' pattern in a SINGLE terminal command. Use `$!` to securely kill ONLY the background server you just started.\n"
+        "6. Always ensure ports are freed immediately after testing so you don't get 'Address already in use' errors.\n"
+        "7. To test logic, write a quick Python/Node test script, run it, and read the output.\n"
     ))
     
     # Strip out Manager and DevOps messages so the Developer only sees its own history

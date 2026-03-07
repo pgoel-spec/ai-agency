@@ -75,8 +75,9 @@ def developer_router_logic(state: AgencyState):
     current_status = state.get("current_status")
     if current_status in ["COMPLETE", "BLOCKED"]:
         return "Manager"
-      
-    return "Manager"
+
+    # Set the routing when there is a text response and no tools are called
+    return "Developer"
 
 def devops_router_logic(state: AgencyState):
     """

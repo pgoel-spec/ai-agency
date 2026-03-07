@@ -198,7 +198,7 @@ def run_terminal_command(command: str, config: RunnableConfig) -> str:
                 "GITHUB_TOKEN": os.environ.get("GITHUB_TOKEN"),
                 "GITHUB_REPO": os.environ.get("GITHUB_REPO"),
             },
-            timeout=15
+            timeout=120
         )
         
         output = ""
@@ -213,7 +213,7 @@ def run_terminal_command(command: str, config: RunnableConfig) -> str:
         return output if output else "Command executed successfully with no output."
         
     except TimeoutError:
-         return "Error: Command timed out after 15 seconds. If you started a persistent server, you must run it in the background and kill it in the same command block."
+         return "Error: Command timed out after 120 seconds. If you started a persistent server, you must run it in the background and kill it in the same command block."
     except Exception as e:
          return f"Terminal Error: {str(e)}"
 
