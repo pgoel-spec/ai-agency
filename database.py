@@ -33,6 +33,7 @@ def init_db():
                 content TEXT,     -- The actual message or tool output
                 tool_name TEXT,   -- Name of the tool (if applicable)
                 is_error BOOLEAN  -- 1 if it failed, 0 if it succeeded
+                input_tokens INTEGER DEFAULT 0
             )
         ''')
         # Safely migrate existing databases by attempting to add the column
@@ -40,27 +41,37 @@ def init_db():
             conn.execute('ALTER TABLE activity_logs ADD COLUMN session_id TEXT')
         except sqlite3.OperationalError:
             pass # Column already exists, safe to ignore
+        try:
+            conn.execute('ALTER TABLE activity_logs ADD COLUMN input_tokens INTEGER DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass
 
-def log_activity(ticket_id, role, content, node_name=None, tool_name=None, is_error=False, session_id=None):
-    """Saves a single event to the database."""
+def log_activity(ticket_id, role, content, node_name=None, tool_name=None, is_error=False, session_id=None, input_tokens=0):
+    """Saves a single event to the database with serialization."""
     try:
-        # If content is a list or dict (like tool args), convert to JSON string
+        # Serialization
+        content_str = ""
         if isinstance(content, (dict, list)):
-            def message_serializer(obj):
-                # LangChain messages have a .dict() method
-                if hasattr(obj, "dict"):
-                    return obj.dict()
-                # Fallback for any other non-serializable objects
-                return str(obj)
-            
-            content = json.dumps(content, default=message_serializer, ensure_ascii=False)
+            try:
+                # default=str forces any non-serializable objects to use their 
+                # native __str__ representation instead of crashing json.dumps.
+                content_str = json.dumps(content, default=str, ensure_ascii=False)
+            except Exception as json_err:
+                # Absolute fallback: if JSON fails, just cast the whole thing to a string
+                print(f"[Log Warning] JSON serialization failed, falling back to string: {json_err}")
+                content_str = str(content)
+        else:
+            # If it's already a string, boolean, etc.
+            content_str = str(content)
         
         with get_db_conn() as conn:
             conn.execute('''
-                INSERT INTO activity_logs (ticket_id, session_id, role, node_name, content, tool_name, is_error)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (ticket_id, session_id, role, node_name, str(content), tool_name, is_error))
+                INSERT INTO activity_logs (ticket_id, session_id, role, node_name, content, tool_name, is_error, input_tokens)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (ticket_id, session_id, role, node_name, content_str, tool_name, is_error, input_tokens))
+
     except Exception as e:
+        # If the actual database insert fails, print it prominently
         print(f"CRITICAL LOGGING FAILURE: {e}")
 
 def get_logs_by_ticket(ticket_id: str):
@@ -69,7 +80,7 @@ def get_logs_by_ticket(ticket_id: str):
         conn.row_factory = sqlite3.Row 
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT timestamp, role, node_name, tool_name, content, is_error 
+            SELECT timestamp, role, node_name, tool_name, content, is_error, input_tokens
             FROM activity_logs 
             WHERE ticket_id = ? 
             ORDER BY timestamp ASC
@@ -82,7 +93,7 @@ def get_logs_by_session(ticket_id: str, session_id: str):
         conn.row_factory = sqlite3.Row 
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT timestamp, role, node_name, tool_name, content, is_error, session_id
+            SELECT timestamp, role, node_name, tool_name, content, is_error, session_id, input_tokens
             FROM activity_logs 
             WHERE ticket_id = ? AND session_id = ?
             ORDER BY timestamp ASC

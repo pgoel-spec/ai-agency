@@ -195,12 +195,13 @@ def process_ticket(ticket_id: str, human_input: str):
                 # --- WIP: CONTEXT REHYDRATION (Checking the Real World) ---
                 # recent_comments = get_recent_linear_comments(ticket_id)
 
-                stream_and_log({"messages": [webhook_msg]}, config, ticket_id, session_id)
+                stream_and_log({"messages": [webhook_msg], "session_id": session_id}, config, ticket_id, session_id)
             else:
                 # Start a new conversation, but force it to use the PR branch
                 initial_state = {
                     "messages": [webhook_msg],
                     "active_ticket_url": ticket_id,
+                    "session_id": session_id,
                     "current_status": "NOT_STARTED",
                     "current_phase": "Planning"
                 }
@@ -232,6 +233,7 @@ def process_ticket(ticket_id: str, human_input: str):
             initial_state = {
                 "messages": [webhook_msg],
                 "active_ticket_url": ticket_id,
+                "session_id": session_id,
                 "current_status": "NOT_STARTED",
                 "current_phase": "Planning"
             }
@@ -357,31 +359,251 @@ async def view_all_logs():
     
     return HTMLResponse(content=html_content)
 
-@app.get("/logs/{ticket_id}")
-async def get_ticket_logs(ticket_id: str):
+# ==========================================
+# 1. THE DATA APIs (Returns raw JSON)
+# ==========================================
+@app.get("/api/logs/{ticket_id}")
+async def api_get_ticket_logs(ticket_id: str):
     try:
         from database import get_logs_by_ticket
         history = get_logs_by_ticket(ticket_id)
-        
         if not history:
-            raise HTTPException(status_code=404, detail="No logs found.")
-            
+            return {"ticket_id": ticket_id, "history": []}
         return {"ticket_id": ticket_id, "history": history}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/logs/{ticket_id}/{session_id}")
-async def get_session_logs(ticket_id: str, session_id: str):
+@app.get("/api/logs/{ticket_id}/{session_id}")
+async def api_get_session_logs(ticket_id: str, session_id: str):
     try:
         from database import get_logs_by_session
         history = get_logs_by_session(ticket_id, session_id)
-        
         if not history:
-            raise HTTPException(status_code=404, detail=f"No logs found for session {session_id}.")
-            
+            return {"ticket_id": ticket_id, "session_id": session_id, "history": []}
         return {"ticket_id": ticket_id, "session_id": session_id, "history": history}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# 2. THE HTML UI (Auto-Polling Viewer)
+# ==========================================
+def get_log_viewer_html(page_title: str, api_endpoint: str):
+    """Generates an HTML page that automatically polls the API for new logs."""
+    return f"""
+    <html>
+        <head>
+            <title>{page_title} - AI Agency</title>
+            <style>
+                body {{ font-family: 'Courier New', Courier, monospace; background-color: #1e1e1e; color: #d4d4d4; padding: 0 10px; margin: 0; }}
+                
+                .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #444; padding: 6px 0; margin-bottom: 6px; position: sticky; top: 0; background-color: #1e1e1e; z-index: 10; }}
+                .header-left {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+                .header a {{ color: #4fc1ff; text-decoration: none; font-family: -apple-system, sans-serif; font-weight: 500; font-size: 0.85em; margin-right: 5px; }}
+                .header a:hover {{ text-decoration: underline; }}
+                
+                .header-btn {{ background: #333; color: #fff; border: 1px solid #555; padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 0.8em; font-family: -apple-system, sans-serif; transition: 0.1s; }}
+                .header-btn:hover {{ background: #4fc1ff; color: #000; border-color: #4fc1ff; }}
+                
+                .controls {{ display: flex; align-items: center; gap: 8px; font-family: -apple-system, sans-serif; font-size: 0.8em; }}
+                .status-dot {{ height: 8px; width: 8px; background-color: #4ade80; border-radius: 50%; display: inline-block; box-shadow: 0 0 6px #4ade80; }}
+                
+                #log-container {{ display: flex; flex-direction: column; gap: 4px; padding-bottom: 20px; }}
+                .log-card {{ background: #252526; padding: 4px 6px; border-radius: 2px; border-left: 3px solid #4fc1ff; }}
+                .log-card.error {{ border-left-color: #f43f5e; }}
+                .log-card.human {{ border-left-color: #a855f7; }}
+                
+                .log-meta {{ font-size: 0.75em; color: #858585; margin-bottom: 2px; border-bottom: 1px dashed #333; padding-bottom: 2px; display: flex; justify-content: space-between; align-items: center; }}
+                .log-meta-left {{ display: flex; gap: 6px; align-items: center; }}
+                .log-meta-right {{ display: flex; align-items: center; gap: 10px; }}
+                
+                .token-container {{ display: flex; align-items: center; gap: 6px; background: #1e1e1e; padding: 2px 6px; border-radius: 3px; border: 1px solid #333; }}
+                .token-bar {{ width: 50px; height: 6px; background: #333; border-radius: 3px; overflow: hidden; }}
+                .token-fill {{ height: 100%; transition: width 0.3s ease; }}
+                .token-fill.safe {{ background: #4ade80; }}
+                .token-fill.danger {{ background: #f43f5e; box-shadow: 0 0 4px #f43f5e; }}
+                .token-text {{ font-size: 0.9em; font-family: monospace; color: #aaa; min-width: 65px; text-align: right; }}
+                
+                .log-content {{ font-size: 0.85em; line-height: 1.15; margin: 0; max-height: 4.6em; overflow: hidden; white-space: pre-wrap; word-wrap: break-word; }}
+                .log-card.expanded .log-content {{ max-height: none; }}
+                
+                .toggle-btn {{ display: none; background: none; border: none; color: #4fc1ff; cursor: pointer; padding: 0; font-family: monospace; font-size: 1.1em; font-weight: bold; }}
+                .toggle-btn:hover {{ text-decoration: underline; }}
+                .log-card.expandable .toggle-btn {{ display: inline-block; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <div class="header-left">
+                    <a href="/logs">← Dashboard</a>
+                    <h4 style="margin: 0 5px 0 0; color: #fff; font-size: 0.9em;">{page_title}</h4>
+                    <button class="header-btn" onclick="setAllCards(true)">Expand All</button>
+                    <button class="header-btn" onclick="setAllCards(false)">Collapse All</button>
+                    <button class="header-btn" style="margin-left: 10px;" onclick="window.scrollTo(0, 0)">↑ Top</button>
+                    <button class="header-btn" onclick="window.scrollTo(0, document.documentElement.scrollHeight)">↓ Bottom</button>
+                </div>
+                <div class="controls">
+                    <span id="status-text">Polling</span>
+                    <span class="status-dot" id="status-indicator"></span>
+                </div>
+            </div>
+
+            <div id="log-container">
+                <div style="color: #858585; font-size: 0.8em;">Waiting for logs...</div>
+            </div>
+
+            <script>
+                let knownLogCount = 0;
+                let isAutoScrollEnabled = true;
+                let allExpanded = false;
+                let isFetching = false;
+                
+                const TOKEN_LIMIT = 10000;
+
+                window.addEventListener('scroll', () => {{
+                    const scrollPosition = window.innerHeight + window.scrollY;
+                    const pageHeight = document.documentElement.scrollHeight;
+                    isAutoScrollEnabled = (pageHeight - scrollPosition < 30);
+                }});
+
+                function toggleSingleCard(btn, id) {{
+                    const card = document.getElementById(`card-${{id}}`);
+                    card.classList.toggle('expanded');
+                    btn.innerText = card.classList.contains('expanded') ? '▲ Collapse' : '▼ Expand';
+                }}
+
+                function setAllCards(expand) {{
+                    allExpanded = expand;
+                    const cards = document.querySelectorAll('.log-card.expandable');
+                    cards.forEach(card => {{
+                        const toggleBtn = card.querySelector('.toggle-btn');
+                        if (expand) {{
+                            card.classList.add('expanded');
+                            toggleBtn.innerText = '▲ Collapse';
+                        }} else {{
+                            card.classList.remove('expanded');
+                            toggleBtn.innerText = '▼ Expand';
+                        }}
+                    }});
+                }}
+
+                async function fetchLogs() {{
+                    if (isFetching) return;
+                    isFetching = true;
+                    
+                    try {{
+                        const fetchUrl = '{api_endpoint}?_t=' + Date.now();
+                        const response = await fetch(fetchUrl, {{ cache: 'no-store' }});
+                        const data = await response.json();
+                        const history = data.history || [];
+
+                        if (history.length > knownLogCount) {{
+                            const container = document.getElementById('log-container');
+                            if (knownLogCount === 0) container.innerHTML = ''; 
+                            
+                            for (let i = knownLogCount; i < history.length; i++) {{
+                                const log = history[i];
+                                const isError = log.is_error ? 'error' : '';
+                                const isHuman = log.role === 'human' ? 'human' : '';
+                                
+                                const toolText = log.tool_name ? ` | Tool: ${{log.tool_name}}` : '';
+                                const nodeText = log.node_name ? `Node: ${{log.node_name}}` : `Role: ${{log.role}}`;
+                                
+                                let tokenHtml = '';
+                                if (log.role === 'ai_prompt') {{
+                                    const tokens = log.input_tokens || 0;
+                                    const percent = Math.min(100, (tokens / TOKEN_LIMIT) * 100);
+                                    const statusClass = tokens > TOKEN_LIMIT ? 'danger' : 'safe';
+                                    
+                                    tokenHtml = `
+                                        <div class="token-container" title="Soft limit: 10k tokens">
+                                            <span class="token-text">${{tokens.toLocaleString()}} tkns</span>
+                                            <div class="token-bar">
+                                                <div class="token-fill ${{statusClass}}" style="width: ${{percent}}%;"></div>
+                                            </div>
+                                        </div>
+                                    `;
+                                }}
+                                
+                                const card = document.createElement('div');
+                                card.className = `log-card ${{isError}} ${{isHuman}}`;
+                                card.id = `card-${{i}}`;
+                                
+                                card.innerHTML = `
+                                    <div class="log-meta">
+                                        <div class="log-meta-left">
+                                            <strong style="color: #d4d4d4;">[#${{i + 1}}]</strong>
+                                            <span>${{log.timestamp}} | ${{nodeText}}${{toolText}}</span>
+                                        </div>
+                                        <div class="log-meta-right">
+                                            ${{tokenHtml}}
+                                            <button class="toggle-btn" id="btn-${{i}}" onclick="toggleSingleCard(this, ${{i}})">▼ Expand</button>
+                                        </div>
+                                    </div>
+                                    <div class="log-content" id="content-${{i}}">${{escapeHTML(log.content)}}</div>
+                                `;
+                                
+                                container.appendChild(card);
+                                
+                                setTimeout(() => {{
+                                    const contentDiv = document.getElementById(`content-${{i}}`);
+                                    if (contentDiv.scrollHeight > contentDiv.clientHeight + 2) {{
+                                        card.classList.add('expandable');
+                                        if (allExpanded) {{
+                                            card.classList.add('expanded');
+                                            document.getElementById(`btn-${{i}}`).innerText = '▲ Collapse';
+                                        }}
+                                    }}
+                                }}, 0);
+                            }}
+                            
+                            knownLogCount = history.length;
+
+                            if (isAutoScrollEnabled) {{
+                                window.scrollTo(0, document.documentElement.scrollHeight);
+                            }}
+                            
+                            const indicator = document.getElementById('status-indicator');
+                            indicator.style.opacity = '0.2';
+                            setTimeout(() => indicator.style.opacity = '1', 200);
+                        }}
+                    }} catch (err) {{
+                        console.error("Failed to fetch logs:", err);
+                        document.getElementById('status-text').innerText = "Disconnected";
+                        document.getElementById('status-indicator').style.backgroundColor = "#f43f5e";
+                    }} finally {{
+                        isFetching = false;
+                    }}
+                }}
+
+                function escapeHTML(str) {{
+                    return String(str)
+                        .replace(/&/g, "&amp;")
+                        .replace(/</g, "&lt;")
+                        .replace(/>/g, "&gt;")
+                        .replace(/"/g, "&quot;")
+                        .replace(/'/g, "&#039;");
+                }}
+
+                fetchLogs();
+                setInterval(fetchLogs, 3000);
+            </script>
+        </body>
+    </html>
+    """
+
+@app.get("/logs/{ticket_id}", response_class=HTMLResponse)
+async def view_ticket_logs(ticket_id: str):
+    return get_log_viewer_html(
+        page_title=f"Full History: {ticket_id}", 
+        api_endpoint=f"/api/logs/{ticket_id}"
+    )
+
+@app.get("/logs/{ticket_id}/{session_id}", response_class=HTMLResponse)
+async def view_session_logs(ticket_id: str, session_id: str):
+    return get_log_viewer_html(
+        page_title=f"Session: {session_id}", 
+        api_endpoint=f"/api/logs/{ticket_id}/{session_id}"
+    )
 
 @app.post("/webhook")
 async def linear_webhook(request: Request, background_tasks: BackgroundTasks):

@@ -136,7 +136,8 @@ def get_tool_names(tools_list) -> list:
 
 # Helper function for Filtering
 def filter_agent_history(messages: list, agent_role: str) -> list:
-    """Filters history so an agent only sees the Human request and its own past actions."""
+    """Filters history so an agent only sees the Human request and its own past actions.
+    Includes Progressive Memory Management to prevent token limits from being exceeded."""
     
     dev_tool_names = get_tool_names(developer_tools)
     devops_tool_names = get_tool_names(devops_tools)
@@ -166,6 +167,9 @@ def filter_agent_history(messages: list, agent_role: str) -> list:
     
     filtered_messages = []
     
+    # ---------------------------------------------------------
+    # PHASE 1: STANDARD FILTERING (Role Isolation)
+    # ---------------------------------------------------------
     for i, msg in enumerate(messages):
         # Convert tuples to objects immediately so logic is consistent
         if isinstance(msg, tuple):
@@ -185,7 +189,14 @@ def filter_agent_history(messages: list, agent_role: str) -> list:
             
             # Is it the actual webhook? Let everyone see it.
             if msg_kwargs.get("source") == "webhook":
-                filtered_messages.append(msg)
+                if i == last_real_human_index:
+                    # It is the CURRENT session's webhook. Let the agent see the active override.
+                    filtered_messages.append(msg)
+                else:
+                    # It is a PAST session's webhook. Strip the old override so it doesn't confuse the agent!
+                    old_msg = msg.copy()
+                    old_msg.content = old_msg.content.split("SYSTEM OVERRIDE")[0].strip()
+                    filtered_messages.append(old_msg)
             
             # ==========================================
             # BROADCAST PROTOCOL
@@ -213,15 +224,21 @@ def filter_agent_history(messages: list, agent_role: str) -> list:
             if msg_name and msg_name.lower() not in [agent_role.lower(), "ai", ""]:
                continue
             
-            new_msg = msg.copy()
+            kwargs_copy = copy.deepcopy(getattr(msg, "additional_kwargs", {}))
 
             # PRUNING LOGIC:
             # If the AI message happened BEFORE the last real webhook (last_real_human_index), 
             # it's from an old session. Strip the signature to save tokens!
             if last_real_human_index != -1 and i < last_real_human_index:
-                if hasattr(new_msg, "additional_kwargs") and "__gemini_function_call_thought_signatures__" in new_msg.additional_kwargs:
-                    new_msg.additional_kwargs = copy.deepcopy(new_msg.additional_kwargs)
-                    new_msg.additional_kwargs.pop("__gemini_function_call_thought_signatures__", None)
+                kwargs_copy.pop("__gemini_function_call_thought_signatures__", None)
+
+            # Create a BRAND NEW message to bypass Pydantic mutation blocks
+            new_msg = AIMessage(
+                content=msg.content,
+                tool_calls=getattr(msg, "tool_calls", []),
+                name=msg_name,
+                additional_kwargs=kwargs_copy
+            )    
 
             # Check if the tools are allowed for this specific agent
             if hasattr(new_msg, "tool_calls") and new_msg.tool_calls:
@@ -231,6 +248,62 @@ def filter_agent_history(messages: list, agent_role: str) -> list:
             else:
                 # Always include text-only AI messages from the agent to themselves
                 filtered_messages.append(new_msg)
+    
+    # ---------------------------------------------------------
+    # PHASE 2: PROGRESSIVE MEMORY MANAGEMENT (Token Optimization)
+    # ---------------------------------------------------------
+    MAX_CHARS_THRESHOLD = 60000  # Trigger truncation if prompt exceeds ~15,000 tokens
+    PROTECTED_WINDOW = 6         # Never truncate the most recent 6 messages
+
+    def get_total_length(msgs):
+        return sum(len(str(getattr(m, "content", ""))) for m in msgs)
+
+    if get_total_length(filtered_messages) > MAX_CHARS_THRESHOLD:
+        # Loop from the oldest message forward, stopping before the protected window
+        for i in range(len(filtered_messages) - PROTECTED_WINDOW):
+            msg = filtered_messages[i]
+            
+            # We only truncate massive Tool Output messages (skip AI thoughts and Human prompts)
+            if getattr(msg, "type", "") == "tool" and len(str(msg.content)) > 2000:
+                
+                # Copy the message so we don't permanently corrupt the LangGraph state database!
+                new_msg = msg.copy()
+                content_str = str(new_msg.content)
+                tool_name = getattr(new_msg, "name", "")
+                
+                if tool_name == "read_file":
+                    # For huge files, strip entirely. The AI already extracted the logic previously.
+                    new_msg.content = (
+                        f"<system_memory_manager>\n"
+                        f"Large file read omitted to save context space. (Original size: {len(content_str)} chars).\n"
+                        f"If you need to reference this file again, use the read_file tool.\n"
+                        f"</system_memory_manager>"
+                    )
+                elif tool_name == "run_terminal_command":
+                    # For terminal commands, the exit code/error is almost always at the very end.
+                    new_msg.content = (
+                        f"<system_memory_manager>\n"
+                        f"Terminal output truncated to save context space. Showing only the final 1500 characters.\n"
+                        f"</system_memory_manager>\n\n"
+                        f"... [TRUNCATED] ...\n\n"
+                        f"{content_str[-1500:]}"
+                    )
+                else:
+                    # Generic fallback for any other huge tools
+                    new_msg.content = (
+                        f"<system_memory_manager>\n"
+                        f"Tool output truncated to save context space. Showing only the final 1500 characters.\n"
+                        f"</system_memory_manager>\n\n"
+                        f"... [TRUNCATED] ...\n\n"
+                        f"{content_str[-1500:]}"
+                    )
+                
+                # Replace the original massive message with the slimmed-down version
+                filtered_messages[i] = new_msg
+                
+                # Check if we have shed enough weight. If yes, stop truncating!
+                if get_total_length(filtered_messages) <= MAX_CHARS_THRESHOLD:
+                    break
                 
     return filtered_messages
 
@@ -450,17 +523,36 @@ def manager_node(state: AgencyState) -> dict:
 
     # Construct the full prompt list
     full_prompt = [system_prompt] + minimal_history + [human_trigger]
+    response = safe_invoke_llm(manager_llm, full_prompt)
 
-    # Exhaustive Log: Log the exact prompt being sent to the LLM 
+    # Extract the exact token usage from Google's response metadata
+    tokens_used = 0
+    if hasattr(response, "usage_metadata") and response.usage_metadata:
+        tokens_used = response.usage_metadata.get("input_tokens", 0)
+
+    # Log the prompt WITH the accurate token count
     log_activity(
         ticket_id=state.get("active_ticket_url", "UNKNOWN"),
+        session_id=state.get("session_id"),
         role="ai_prompt",
         content=full_prompt,
-        node_name="Manager"
+        node_name="Manager",
+        input_tokens=tokens_used
     )
-    
-    response = safe_invoke_llm(manager_llm, full_prompt)
-    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="Manager", additional_kwargs={"timestamp": get_short_time()})
+
+    # The Safety Catch
+    if not response.content and not getattr(response, "tool_calls", []):
+        # The agent glitched and returned absolutely nothing. 
+        # Force it to wake up and take an action.
+        response.content = "SYSTEM: You returned an empty response. Please explain your thought process and either use a tool to continue, or use ReportStatus to end your turn."
+
+    # Safely merge the LLM's thoughts with a timestamp
+    new_kwargs = copy.deepcopy(getattr(response, "additional_kwargs", {}))
+    new_kwargs["timestamp"] = get_short_time()
+
+    # Reconstruct the message
+    # response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="Manager", additional_kwargs=new_kwargs)
+    response = response.copy(update={"name": "Manager", "additional_kwargs": new_kwargs})
     return {"messages": [response]}
 
 def manager_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
@@ -609,23 +701,47 @@ def developer_node(state: AgencyState) -> dict:
 
     # Construct the full prompt list
     full_prompt = [system_prompt] + isolated_history
-    
-    # Exhaustive Log: Log the exact prompt being sent to the LLM 
+    response = safe_invoke_llm(developer_llm, full_prompt)
+
+    # DEBUGGING: Print the exact finish reason and raw metadata to your terminal
+    print("--- DEBUG INFO ---")
+    print("FINISH REASON:", getattr(response, "response_metadata", {}).get("finish_reason", "UNKNOWN"))
+    print("RAW METADATA:", getattr(response, "response_metadata", {}))
+    print("------------------")
+
+    # Extract the exact token usage from Google's response metadata
+    tokens_used = 0
+    if hasattr(response, "usage_metadata") and response.usage_metadata:
+        tokens_used = response.usage_metadata.get("input_tokens", 0)
+
+    # Log the prompt WITH the accurate token count
     log_activity(
         ticket_id=state.get("active_ticket_url", "UNKNOWN"),
+        session_id=state.get("session_id"),
         role="ai_prompt",
         content=full_prompt,
-        node_name="Developer"
+        node_name="Developer",
+        input_tokens=tokens_used
     )
 
-    response = safe_invoke_llm(developer_llm, full_prompt)
-    # Reconstruct as a clean AIMessage to ensure serializability
-    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="Developer", additional_kwargs={"timestamp": get_short_time()})
+    # Safely merge the LLM's thoughts with a timestamp
+    new_kwargs = copy.deepcopy(getattr(response, "additional_kwargs", {}))
+    new_kwargs["timestamp"] = get_short_time()
 
-    # Append the AI response, and POTENTIALLY a ToolMessage
+    # Reconstruct as a clean AIMessage to ensure serializability
+    # response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="Developer", additional_kwargs=new_kwargs)
+    response = response.copy(update={"name": "Developer", "additional_kwargs": new_kwargs})
     messages_to_add = [response]
+
+    # The Safety Catch
+    if not response.content and not getattr(response, "tool_calls", []):
+        # The agent glitched and returned absolutely nothing. 
+        # Force it to wake up and take an action.
+        nudge = HumanMessage(content="SYSTEM: Your previous response was empty. Please state your thoughts, invoke a tool to proceed, or use the ReportStatus tool if you are completely finished.")
+        messages_to_add.append(nudge)
     
     if hasattr(response, "tool_calls") and response.tool_calls:
+        remaining_tool_calls = []
         for tool in response.tool_calls:
             # Interecept the Controller Tool
             if tool["name"] == "ReportStatus":
@@ -640,6 +756,10 @@ def developer_node(state: AgencyState) -> dict:
                     name=tool["name"],
                     tool_call_id=tool["id"]
                 ))
+            else:
+                # Keep regular tools (like read_file, terminal) for the actual ToolNode
+                remaining_tool_calls.append(tool)
+        response.tool_calls = remaining_tool_calls
                 
     return {
         "messages": messages_to_add,
@@ -726,19 +846,38 @@ def devops_node(state: AgencyState) -> dict:
     isolated_history = filter_agent_history(state["messages"], agent_role="DevOps")
     # Construct the full prompt list
     full_prompt = [system_prompt] + isolated_history
-    
-    # Exhaustive Log: Log the exact prompt being sent to the LLM 
+    response = safe_invoke_llm(devops_llm, full_prompt)
+
+    # Extract the exact token usage from Google's response metadata
+    tokens_used = 0
+    if hasattr(response, "usage_metadata") and response.usage_metadata:
+        tokens_used = response.usage_metadata.get("input_tokens", 0)
+
+    # Log the prompt WITH the accurate token count
     log_activity(
         ticket_id=state.get("active_ticket_url", "UNKNOWN"),
+        session_id=state.get("session_id"),
         role="ai_prompt",
         content=full_prompt,
-        node_name="DevOps"
+        node_name="DevOps",
+        input_tokens=tokens_used
     )
 
-    response = safe_invoke_llm(devops_llm, full_prompt)
-    response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="DevOps", additional_kwargs={"timestamp": get_short_time()})
+    # Safely merge the LLM's thoughts with a timestamp
+    new_kwargs = copy.deepcopy(getattr(response, "additional_kwargs", {}))
+    new_kwargs["timestamp"] = get_short_time()
+
+    # response = AIMessage(content=response.content, tool_calls=response.tool_calls, name="DevOps", additional_kwargs=new_kwargs)
+    response = response.copy(update={"name": "DevOps", "additional_kwargs": new_kwargs})
     messages_to_add = [response]
     
+    # The Safety Catch
+    if not response.content and not getattr(response, "tool_calls", []):
+        # The agent glitched and returned absolutely nothing. 
+        # Force it to wake up and take an action.
+        nudge = HumanMessage(content="SYSTEM: Your previous response was empty. Please state your thoughts, invoke a tool to proceed, or use the ReportStatus tool if you are completely finished.")
+        messages_to_add.append(nudge)
+
     if hasattr(response, "tool_calls") and response.tool_calls:
         for tool in response.tool_calls:
             # Interecept the Controller Tool
