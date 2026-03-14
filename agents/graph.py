@@ -48,10 +48,9 @@ def manager_tools_router(state: AgencyState):
     # loop back to the Manager brain so it can evaluate what to do next.
     return "Manager"
 
-def developer_router_logic(state: AgencyState):
+def developer_brain_router(state: AgencyState):
     """
-    The internal loop: If the developer called a tool, go to the tools node. 
-    If the developer just replied with text (finished), go report to the Manager.
+    Routes out of the Developer's Brain.
     """
     # Failsafe to break a stubborn developer out of an infinite coding loop
     if state.get("dev_iteration_count", 0) >= DEVELOPER_ITERATION_LIMIT:
@@ -62,14 +61,9 @@ def developer_router_logic(state: AgencyState):
     messages = state["messages"]
     last_ai_msg = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)    
     
-    # Priority Check: If there are tools OTHER than ReportStatus, execute them first
+    # Route to DeveloperTools if ANY tool was called.
     if last_ai_msg and hasattr(last_ai_msg, "tool_calls") and last_ai_msg.tool_calls:
-        # Check if any tool calls in this turn are NOT handled by the node itself
-        has_functional_tools = any(
-            tc["name"] not in ["ReportStatus"] for tc in last_ai_msg.tool_calls
-        )
-        if has_functional_tools:
-            return "DeveloperTools"
+        return "DeveloperTools"
 
     # If no functional tools are pending, respect the status update
     current_status = state.get("current_status")
@@ -79,26 +73,47 @@ def developer_router_logic(state: AgencyState):
     # Set the routing when there is a text response and no tools are called
     return "Developer"
 
-def devops_router_logic(state: AgencyState):
+def developer_tools_router(state: AgencyState):
     """
-    Internal loop for DevOps: Brain -> Tools -> Brain -> Manager.
+    Routes out of the Developer's Hands.
+    If the status successfully changed to COMPLETE or BLOCKED (passing the Verification Gate),
+    go to Manager. Otherwise, loop back to Developer.
     """
-    
+    current_status = state.get("current_status")
+    if current_status in ["COMPLETE", "BLOCKED"]:
+        return "Manager"
+    return "Developer"
+
+def devops_brain_router(state: AgencyState):
+    """
+    Routes out of the DevOps Brain.
+    Since DevOpsReport is a tool, the brain ALWAYS routes to DevOpsTools to finish a task
+    or execute GitHub commands.
+    """
     messages = state["messages"]
     last_ai_msg = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
 
+    # Did the AI call ANY tools? Go to the Hands!
     if last_ai_msg and hasattr(last_ai_msg, "tool_calls") and last_ai_msg.tool_calls:
-        # Check if there are any tools other than the report
-        has_functional_tools = any(
-            tc["name"] not in ["DevOpsReport"] for tc in last_ai_msg.tool_calls
-        )
-        if has_functional_tools:
-            return "DevOpsTools"
+        return "DevOpsTools"
     
+    # If the AI just output text (no tools), loop back to the DevOps node
+    return "DevOps"
+
+
+def devops_tools_router(state: AgencyState):
+    """
+    Routes out of the DevOps Hands.
+    This is where the actual "Task Finished" routing happens.
+    """
+    # If the DevOpsReport tool successfully updated the state to COMPLETE,
+    # we leave the DevOps loop and return control to the Manager.
     if state.get("current_status") == "COMPLETE":
         return "Manager"
         
-    return "Manager"
+    # Otherwise, the agent was just running normal tools (like create_github_pr). 
+    # Loop back to the Brain to let it read the output.
+    return "DevOps"
 
 # ==========================================
 # THE ORCHESTRATOR (The "Org Chart")
@@ -123,7 +138,6 @@ workflow.add_conditional_edges(
     manager_brain_router,
     {"ManagerTools": "ManagerTools", "FINISH": END}
 )
-
 workflow.add_conditional_edges(
     "ManagerTools",
     manager_tools_router,
@@ -133,20 +147,26 @@ workflow.add_conditional_edges(
 # Developer Loop: The Developer decides whether to use a tool or report back to the Manager
 workflow.add_conditional_edges(
     "Developer", 
-    developer_router_logic,
+    developer_brain_router,
     {"DeveloperTools": "DeveloperTools", "Manager": "Manager", "Developer": "Developer"}
 )
-# After tools execute, always go back to the Developer's brain to review the output
-workflow.add_edge("DeveloperTools", "Developer")
+workflow.add_conditional_edges(
+    "DeveloperTools", 
+    developer_tools_router,
+    {"Manager": "Manager", "Developer": "Developer"}
+)
 
 # DevOps Loop
 workflow.add_conditional_edges(
     "DevOps", 
-    devops_router_logic,
+    devops_brain_router,
     {"DevOpsTools": "DevOpsTools", "Manager": "Manager", "DevOps": "DevOps"}
 )
-# After tools execute, always go back to the DevOps brain to summarize success
-workflow.add_edge("DevOpsTools", "DevOps")
+workflow.add_conditional_edges(
+    "DevOpsTools", 
+    devops_tools_router,
+    {"Manager": "Manager", "DevOps": "DevOps"}
+)
 
 # 1. Create a persistent SQLite connection
 # check_same_thread=False is crucial for FastAPI so it doesn't crash on concurrent requests

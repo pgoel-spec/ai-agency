@@ -26,3 +26,6 @@ class AgencyState(TypedDict):
     current_phase: str
     current_status: str
     last_report: str
+    
+    # Tracks if the AI has tested its code since the last write_file
+    has_verified_code: bool

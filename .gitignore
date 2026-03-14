@@ -63,3 +63,4 @@ dockerfile
 test.py
 output
 output/
+tenant_vault.json

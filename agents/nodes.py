@@ -8,7 +8,10 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from .state import AgencyState, DEVELOPER_ITERATION_LIMIT
-from .tools import update_linear_ticket, create_github_pr, run_terminal_command, read_file, write_file, sync_wip_commit
+from .tools import (
+    update_linear_ticket, create_github_pr, run_terminal_command, 
+    read_file, write_file, sync_wip_commit, manage_dev_server, inspect_frontend
+)
 from database import get_logs_by_ticket, log_activity
 from tenacity import (
     retry,
@@ -74,7 +77,7 @@ class DevOpsReport(BaseModel):
     pr_url: str = Field(description="The URL of the created PR, if applicable.", default="")
 
 manager_tools = [RouteDecision, update_linear_ticket]
-developer_tools = [ReportStatus, run_terminal_command, read_file, write_file, sync_wip_commit]
+developer_tools = [ReportStatus, run_terminal_command, read_file, write_file, sync_wip_commit, manage_dev_server, inspect_frontend]
 devops_tools = [DevOpsReport, create_github_pr]
 
 # Initialize the Models via Vertex AI with JSON enforcement
@@ -640,7 +643,7 @@ def developer_node(state: AgencyState) -> dict:
         "YOUR INSTRUCTIONS:\n"
         "1. Work through the process step-by-step. After every tool call, analyze the output before deciding your next move. You can call `write_file` and immediately call `sync_wip_commit` in the exact same response to save time.\n"
         #"1. Work through the process intelligently. You are encouraged to BATCH multiple tool calls in a single turn whenever possible to save time. For example, you can call `write_file` and immediately call `sync_wip_commit` in the exact same response.\n"
-        "2. Initialization: If the repository isn't cloned yet, clone it using: `git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git`. Use `cd <folder_name>` to enter the repository before running git commands or modifying files.\n"
+        "2. Initialization & Dependencies: If the repository isn't cloned yet, clone it using: `git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git`. Use `cd <folder_name>` to enter the repository before running git commands or modifying files. CRITICAL: Whenever you clone a fresh repo or check out a branch, you MUST actively check for dependency files (e.g., `package.json`, `requirements.txt`, `pom.xml`). If they exist, you must run the appropriate install command (e.g., `npm install`, `pip install -r requirements.txt`) in that specific directory before attempting to run any tests or start servers.\n"
         "3. Codebase Exploration: Do NOT guess file paths. Your first priority is to build a 'System Map':\n"
         "   - Run `ls -R` to understand the full directory hierarchy.\n"
         "   - Identify and read the 'Source of Truth' files: Look for dependency manifests (e.g., package.json, requirements.txt, pyproject.toml) and core schemas or state definitions.\n"
@@ -656,10 +659,11 @@ def developer_node(state: AgencyState) -> dict:
         "   - Use this if you have successfully completed a chunk of the task, but the overall feature is not finished yet, and you are NOT blocked.\n"
         "   - Example: You built the HTML/CSS successfully and want to log your progress before starting the complex API logic.\n\n"
     
-        "4.3. STATE: 'BLOCKED' (Human-in-the-Loop)\n"
+        "4.3. STATE: 'BLOCKED' (Human-in-the-Loop & Secrets Protocol)\n"
         "   - You are operating in a restricted sandbox to build a Production App. Use this immediately if your solution requires external API keys, database credentials, or bypasses network blocks. DO NOT fake the implementation with mock data.\n"
-        "   - Step A: Leave highly detailed placeholders in your code. Provide exact, step-by-step instructions for the human inside the comments (e.g., `// TODO: HUMAN ACTION REQUIRED \n // Step 1: Add API key here. \n // Step 2: Uncomment this fetch block.`).\n"
-        "   - Step B: Call `ReportStatus(status='BLOCKED')`. In the `thought` parameter, state the exact file name, line number, and repeat your step-by-step instructions so the Manager can add them to the Linear ticket.\n\n"
+        "   - Step A (Coding): NEVER hardcode API keys or secrets into the codebase. Write your code to read secrets securely from environment variables (e.g., `process.env.NEWS_API_KEY`). YOU MUST also add the variable name (without the real value) to a `.env.example` file in the root of the project.\n"
+        "   - Step B (Frontend Security): If the frontend requires a secret API key, you MUST NOT put the key in the frontend JS. You must proxy the API call through your backend server/functions to protect the secret.\n"
+        "   - Step C (Blocking): Call `ReportStatus(status='BLOCKED')`. In the `thought` parameter, NEVER ask the client to paste a secret into the ticketing system. Instead, instruct the client exactly like this: 'I am blocked. Please complete these two steps: 1) Securely add the [NAME_OF_VARIABLE] API key to your Project Settings Vault in the AI Agency dashboard so I can test it. 2) Add the exact same key to your GitHub Repository Secrets so the Firebase auto-deploy will work. Reply \"Done\" to this ticket when finished.'\n\n"
         
         "5. DO NOT attempt to use `git commit` or `git push` yourself via the terminal under any circumstances. If you need to save your progress, you MUST use the dedicated `sync_wip_commit` tool. You must call `sync_wip_commit` regularly after every major `write_file` operation or significant codebase change to ensure your progress is continuously backed up.\n"
         "6. IMPORTANT: `ReportStatus` is a handoff tool which must be called in a separate, final turn. DO NOT call `ReportStatus` in the same turn as any other tool.\n\n"
@@ -670,25 +674,46 @@ def developer_node(state: AgencyState) -> dict:
         "- Ensure all interfaces are fully responsive (mobile-first), use modern typography (e.g., Inter or Roboto via Google Fonts), incorporate soft shadows, rounded corners (`rounded-lg`), and proper whitespace (`gap`, `p-`, `m-`).\n"
         "- Add subtle hover states and CSS transitions to make the UI feel interactive.\n\n"
 
+        "CI/CD & SECRETS MANAGEMENT:\n"
+        "1. `.env.example`: Whenever you introduce a new environment variable (e.g., `process.env.STRIPE_KEY`), you MUST document it by adding the variable name to a `.env.example` file at the root of the project.\n"
+        "2. GitHub Actions / Firebase Auto-Deploy: If the project uses GitHub Actions (check `.github/workflows/` for `.yml` files), the CI/CD pipeline will fail if it cannot access the new secret. You MUST update the workflow `.yml` file to inject the secret into the build or deploy step. Map the environment variable to the GitHub Secret exactly like this under the `env:` block of the relevant step:\n"
+        "   env:\n"
+        "     [VARIABLE_NAME]: ${{ secrets.[VARIABLE_NAME] }}\n\n"
+
         "DIRECTORY & FIREBASE RULES:\n"
         "1. NEVER move, create, or modify `firebase.json` or `.firebaserc` inside a subfolder (like `public`, `src`, or `dist`).\n"
         "2. Firebase configuration files MUST always remain at the absolute root of the repository.\n"
         "3. Only place your actual frontend code (HTML, CSS, JS) inside the `public` directory. Make sure `firebase.json` points its hosting 'public' key to this folder.\n\n"
-
+        
         "RESUMING WORK (AFTER Human-in-the-Loop or Crash):\n"
         "If the Manager routes a task back to you or overrides your system state with an active branch:\n"
-        "1. DO NOT start from scratch on the `main` branch.\n"
-        "2. Always check your instructions and run `git checkout <branch-name>` so you pull down the code you or the human just fixed.\n"
+        "1. DO NOT start from scratch on the `main` branch. Always run `git checkout <branch-name>` so you pull down the latest code.\n"
+        "2. SECRETS INJECTION: If the human just replied 'Done' regarding a secret API key, that secret is now securely injected into your terminal environment by the SaaS backend. Do not try to create a local `.env` file yourself. Just run your tests (e.g., `node test.js`) and the code will successfully read `process.env...`.\n"
         "3. Intelligently assess your progress and continue working on the original ticket. If you hit a new roadblock, fall back to the Human-in-the-Loop protocol and ask the human for help. If the feature is ready for a Pull Request, report COMPLETE.\n"
 
-        "RULES FOR TESTING:\n"
-        "1. RESTRICTED ENVIRONMENT: You do not have root/sudo access. NEVER use 'sudo' or the '-g' (global) flag with npm or pip or try to modify system directories like `/usr/lib/`. This will cause errors.\n"
-        "2. To execute CLI tools (like firebase, tsc, or next), you MUST use 'npx' (e.g., 'npx firebase deploy') to ensure the local version is used.\n"
-        "3. If a terminal command returns 'context deadline exceeded' or 'timeout', it means you ran a persistent/blocking process (like a web server) in the background without proper detachment. You must kill the process and use short-lived test scripts instead.\n"
-        "4. EMULATOR WORKAROUND: If the Firebase Emulator fails to bind to ports, do not retry. Instead, create a standalone Node.js test script that imports your Express app/functions. Use a library like 'supertest' (if available) or mock the Request/Response objects manually to verify logic without a live network server.\n"
-        "5. To test a web server, use the 'Start, Curl, Kill' pattern in a SINGLE terminal command. Use `$!` to securely kill ONLY the background server you just started.\n"
-        "6. Always ensure ports are freed immediately after testing so you don't get 'Address already in use' errors.\n"
-        "7. To test logic, write a quick Python/Node test script, run it, and read the output.\n"
+       "RULES FOR TESTING & DEBUGGING (ENVIRONMENT CRITICAL):\n"
+        "1. RESTRICTED ENVIRONMENT: You do not have root/sudo access. NEVER use 'sudo' or the '-g' (global) flag with npm or pip. To execute CLI tools, you MUST use 'npx' (e.g., 'npx firebase emulators:start') to ensure the local version is used.\n"
+        "2. THE HAO LOOP: When fixing a bug, you MUST follow the Hypothesis -> Action -> Observation loop.\n"
+        "   - Hypothesis: State what you think is wrong.\n"
+        "   - Action: Use `write_file` to fix it.\n"
+        "   - Observation: You MUST test the code to observe if it worked before declaring the task COMPLETE.\n"
+        "3. SERVER MANAGEMENT & WAITING (Urgent): Never use `run_terminal_command` to start a web server (it will cause a timeout). You MUST use the `manage_dev_server` tool to start/stop servers in the background (e.g., `manage_dev_server(action='start', command='npx firebase emulators:start')`). IMPORTANT: When you call `action='start'`, you MUST NOT call `action='logs'` or test the port in the exact same turn. Perform exploration or edits for at least 2 turns before checking logs, as the emulator takes time to boot.\n"
+        "4. OBSERVATION TOOLS & ENVIRONMENT LIMITATIONS: To complete your HAO loop, you normally observe results via `manage_dev_server(action='logs')` or `inspect_frontend(url='http://localhost:5000')`. HOWEVER, be aware that this E2B sandbox is currently missing critical system libraries (`libnspr4.so`). This often causes tools like Playwright and Firebase Java emulators to crash silently, resulting in 'connection refused' errors and empty logs.\n"
+        "5. UNIT TESTING PIVOT (EMULATOR WORKAROUND): If local ports fail to bind, `manage_dev_server` continues to return empty logs, OR `curl` results in 'connection refused' after you have waited the required boot time:\n"
+        "   - ABANDON live server testing immediately. Do not attempt `inspect_frontend` again.\n"
+        "   - Use `write_file` to create isolated unit test files (e.g., `jest`, `pytest`, or a simple `test_logic.js` script that directly imports your backend functions/logic).\n"
+        "   - Run these unit tests directly via `run_terminal_command(command='node test_logic.js')` to verify your logic without booting a network server.\n"
+        "   - Prove your code works via this unit test output to satisfy your Observation and bypass the Verification Gate.\n"
+        
+        # "RULES FOR TESTING:\n"
+        # "1. RESTRICTED ENVIRONMENT: You do not have root/sudo access. NEVER use 'sudo' or the '-g' (global) flag with npm or pip or try to modify system directories like `/usr/lib/`. This will cause errors.\n"
+        # "2. To execute CLI tools (like firebase, tsc, or next), you MUST use 'npx' (e.g., 'npx firebase deploy') to ensure the local version is used.\n"
+        # "3. If a terminal command returns 'context deadline exceeded' or 'timeout', it means you ran a persistent/blocking process (like a web server) in the background without proper detachment. You must kill the process and use short-lived test scripts instead.\n"
+        # "4. EMULATOR WORKAROUND: If the Firebase Emulator fails to bind to ports, do not retry. Instead, create a standalone Node.js test script that imports your Express app/functions. Use a library like 'supertest' (if available) or mock the Request/Response objects manually to verify logic without a live network server.\n"
+        # "5. To test a web server, use the 'Start, Curl, Kill' pattern in a SINGLE terminal command. Use `$!` to securely kill ONLY the background server you just started.\n"
+        # "6. Always ensure ports are freed immediately after testing so you don't get 'Address already in use' errors.\n"
+        # "7. To test logic, write a quick Python/Node test script, run it, and read the output.\n"
+
     ))
     
     # Strip out Manager and DevOps messages so the Developer only sees its own history
@@ -740,33 +765,7 @@ def developer_node(state: AgencyState) -> dict:
         nudge = HumanMessage(content="SYSTEM: Your previous response was empty. Please state your thoughts, invoke a tool to proceed, or use the ReportStatus tool if you are completely finished.")
         messages_to_add.append(nudge)
     
-    if hasattr(response, "tool_calls") and response.tool_calls:
-        remaining_tool_calls = []
-        for tool in response.tool_calls:
-            # Interecept the Controller Tool
-            if tool["name"] == "ReportStatus":
-                current_phase = tool["args"].get("phase", current_phase)
-                current_status = tool["args"].get("status", current_status)
-                last_report = tool["args"].get("thought", last_report)
-                print(f"[Developer Status]: {current_status} - {last_report}")
-                
-                # Execute it inline
-                messages_to_add.append(ToolMessage(
-                    content="Status successfully logged in system state.",
-                    name=tool["name"],
-                    tool_call_id=tool["id"]
-                ))
-            else:
-                # Keep regular tools (like read_file, terminal) for the actual ToolNode
-                remaining_tool_calls.append(tool)
-        response.tool_calls = remaining_tool_calls
-                
-    return {
-        "messages": messages_to_add,
-        "current_phase": current_phase,
-        "current_status": current_status,
-        "last_report": last_report
-    }
+    return {"messages": messages_to_add}
 
 def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
     """The Worker's Hands: Executes the tools requested by the Developer Brain."""
@@ -779,13 +778,62 @@ def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
         "run_terminal_command": run_terminal_command,
         "read_file": read_file,
         "write_file": write_file,
-        "sync_wip_commit": sync_wip_commit
+        "sync_wip_commit": sync_wip_commit,
+        "manage_dev_server": manage_dev_server,
+        "inspect_frontend": inspect_frontend
     }
+
+    # Fetch existing status
+    has_verified = state.get("has_verified_code", False)
+    current_phase = state.get("current_phase", "Implementation & Testing")
+    current_status = state.get("current_status", "IN_PROGRESS")
+    last_report = state.get("last_report", "")
+
+    updates = {}
 
     if hasattr(last_ai_msg, "tool_calls") and last_ai_msg.tool_calls:
         for tool in last_ai_msg.tool_calls:
             tool_name = tool["name"]
             
+            # --- 1. HANDLE CONTROLLER TOOL (ReportStatus) ---
+            if tool_name == "ReportStatus":
+                attempted_status = tool["args"].get("status", current_status)
+                
+                # The Verification Gate
+                if attempted_status == "COMPLETE" and not has_verified:
+                    print("\n[SYSTEM]: Blocked AI from completing task without verification.")
+                    messages_to_add.append(ToolMessage(
+                        content="SYSTEM ERROR: Verification Gate Failed! You cannot report COMPLETE because you have not observed the results of your code changes. You MUST start the server and use `inspect_frontend` or check `manage_dev_server` logs to prove the code works before calling ReportStatus.",
+                        name=tool_name,
+                        tool_call_id=tool["id"]
+                    ))
+                else:
+                    # Gate passed, extract the new variables
+                    new_phase = tool["args"].get("phase", current_phase)
+                    new_report = tool["args"].get("thought", last_report)
+                    
+                    # Update the state variables
+                    updates["current_phase"] = new_phase
+                    updates["current_status"] = attempted_status
+                    updates["last_report"] = new_report
+                    print(f"[Developer Status]: {attempted_status} - {new_report}")
+
+                    messages_to_add.append(ToolMessage(
+                        content="Status successfully logged in system state.",
+                        name=tool_name,
+                        tool_call_id=tool["id"]
+                    ))
+                continue # Skip the dynamic execution block below
+
+            # --- VERIFICATION TRACKING LOGIC ---
+            if tool_name == "write_file":
+                has_verified = False # Reset verification when code changes
+            elif tool_name == "inspect_frontend":
+                has_verified = True  # Successfully tested frontend
+            elif tool_name == "manage_dev_server" and tool["args"].get("action") == "logs":
+                has_verified = True  # Successfully checked backend logs
+            # -----------------------------------
+
             # Dynamically execute actual tools
             if tool_name in tool_map:
                 args = tool["args"].copy()
@@ -812,7 +860,10 @@ def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
     
     # Increment execution count to prevent infinite loops
     new_count = state.get("dev_iteration_count", 0) + 1
-    return {"messages": messages_to_add, "dev_iteration_count": new_count}
+    updates["messages"] = messages_to_add
+    updates["dev_iteration_count"] = new_count
+    updates["has_verified_code"] = has_verified
+    return updates
 
 def devops_node(state: AgencyState) -> dict:
     """The DevOps Brain: Decides whether to call tools or report completion to the Manager."""
@@ -877,20 +928,43 @@ def devops_node(state: AgencyState) -> dict:
         # Force it to wake up and take an action.
         nudge = HumanMessage(content="SYSTEM: Your previous response was empty. Please state your thoughts, invoke a tool to proceed, or use the ReportStatus tool if you are completely finished.")
         messages_to_add.append(nudge)
+    
+    return {"messages": messages_to_add}
 
-    if hasattr(response, "tool_calls") and response.tool_calls:
-        for tool in response.tool_calls:
-            # Interecept the Controller Tool
-            if tool["name"] == "DevOpsReport":
-                current_status = tool["args"].get("status", current_status)
-                last_report = tool["args"].get("thought", last_report)
+def devops_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
+    """The DevOps Hands: Executes the actual PR tool and status reports."""
+    
+    last_ai_msg = next((m for m in reversed(state["messages"]) if isinstance(m, AIMessage)), None)
+    messages_to_add = []
+    
+    # The Registry: Add any future DevOps tools here
+    tool_map = {
+        "create_github_pr": create_github_pr,
+    }
+
+    # Fetch existing state
+    current_status = state.get("current_status", "IN_PROGRESS")
+    last_report = state.get("last_report", "")
+    
+    # Prepare state updates
+    updates = {}
+    
+    if hasattr(last_ai_msg, "tool_calls") and last_ai_msg.tool_calls:
+        for tool in last_ai_msg.tool_calls:
+            tool_name = tool["name"]
+            
+            # Handle Controller Tool (DevOpsReport)
+            if tool_name == "DevOpsReport":
+                attempted_status = tool["args"].get("status", current_status)
+                new_report = tool["args"].get("thought", last_report)
                 pr_url = tool["args"].get("pr_url", "")
-                # print(f"[DevOps Status]: {current_status} | PR: {pr_url}")
+                
+                print(f"[DevOps Status]: {attempted_status} | PR: {pr_url}")
                 
                 # Execute it inline
                 messages_to_add.append(ToolMessage(
                     content="Status successfully logged in system state.",
-                    name=tool["name"],
+                    name=tool_name,
                     tool_call_id=tool["id"]
                 ))
 
@@ -898,37 +972,19 @@ def devops_node(state: AgencyState) -> dict:
                 # BROADCAST PROTOCOL (P2P COMMUNICATION)
                 # Agents emit a HumanMessage with name="Broadcast" to
                 # share important information globally across the team.
-                # This bypasses the History Filter and is visible in all context windows.
                 # ==========================================
-
-                # Add the HumanMessage to Broadcast to the Developer
                 messages_to_add.append(HumanMessage(
-                    content=f"DEVOPS BROADCAST: Code pushed. PR URL: {pr_url} | Notes: {last_report}",
+                    content=f"DEVOPS BROADCAST: Code pushed. PR URL: {pr_url} | Notes: {new_report}",
                     name="Broadcast",
                     additional_kwargs={"timestamp": get_short_time()}
                 ))
-    return {
-        "messages": messages_to_add,
-        "current_phase": current_phase,
-        "current_status": current_status,
-        "last_report": last_report
-    }
+                
+                # Update the state variables
+                updates["current_status"] = attempted_status
+                updates["last_report"] = new_report
+                continue # Skip the dynamic execution block below
 
-def devops_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
-    """The DevOps Hands: Executes the actual PR tool."""
-    last_msg = state["messages"][-1]
-    messages_to_add = []
-    
-    # The Registry: Add any future DevOps tools here
-    tool_map = {
-        "create_github_pr": create_github_pr,
-    }
-    
-    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-        for tool in last_msg.tool_calls:
-            tool_name = tool["name"]
-            
-           # Dynamically execute actual tools
+            # Execute Standard Tools
             if tool_name in tool_map:
                 args = tool["args"].copy()
                 
@@ -953,4 +1009,5 @@ def devops_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
                     tool_call_id=tool["id"]
                 ))
                 
-    return {"messages": messages_to_add}
+    updates["messages"] = messages_to_add
+    return updates

@@ -10,6 +10,7 @@ from database import init_db, log_activity, get_db_conn
 from langchain_core.messages import HumanMessage
 from datetime import datetime
 import time
+import json
 
 active_tickets = set() # Global set to track currently processing tickets
 load_dotenv() # Load the .env file so the API keys are available to the tools
@@ -63,7 +64,7 @@ def get_recent_linear_comments(ticket_id: str) -> str:
         
     return "Could not fetch history."
 
-def process_ticket(ticket_id: str, human_input: str):
+def process_ticket(ticket_id: str, human_input: str, tenant_config: dict):
     """
     Synchronous background task to run the AI team.
     FastAPI automatically runs standard 'def' background tasks in a separate thread pool,
@@ -74,7 +75,8 @@ def process_ticket(ticket_id: str, human_input: str):
     config = {
         "configurable": {
             "thread_id": ticket_id,
-            "sandbox": workspace # Pass the sandbox here, NOT in the state!
+            "sandbox": workspace, # Pass the sandbox here, NOT in the state!
+            "tenant_config": tenant_config
         }
     }
 
@@ -254,11 +256,14 @@ def process_ticket(ticket_id: str, human_input: str):
         # Always clean up the sandbox to save compute!
         workspace.kill()
 
-def process_ticket_with_lock(ticket_id: str, human_input: str):
+def process_ticket_with_lock(ticket_id: str, human_input: str, tenant_config: dict = None):
     """Wraps process_ticket to ensure the lock is released when the job finishes."""
+    if tenant_config is None:
+        tenant_config = {}
+    
     try:
         # Run the existing AI logic
-        process_ticket(ticket_id, human_input)
+        process_ticket(ticket_id, human_input, tenant_config)
     finally:
         # Always remove the ticket from the active list when finished or if it crashes
         active_tickets.discard(ticket_id)
@@ -617,18 +622,33 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
         # If the webhook is a comment, the ID is nested differently
         ticket_id = payload.get("data", {}).get("issue", {}).get("id", "UNKNOWN-ID")
         human_input = payload.get("data", {}).get("body", "No comment provided.")
+
+        # Extract team_id for comments
+        team_id = payload.get("data", {}).get("issue", {}).get("teamId", "DEFAULT_TEAM")
     else:
         # Standard new issue creation
         ticket_id = payload.get("data", {}).get("id", "UNKNOWN-ID")
         ticket_title = payload.get("data", {}).get("title", "New Task")
         ticket_description = payload.get("data", {}).get("description", "")
         
+        # Extract team_id for issues
+        team_id = payload.get("data", {}).get("teamId", "DEFAULT_TEAM")
+
         human_input = (
             f"New Task Assigned: {ticket_title}\n\n"
             f"Description: {ticket_description}\n\n"
             f"IMPORTANT: The active Linear Ticket ID for this task is {ticket_id}.\n"
             f"IMPORTANT: Do not guess or invent a repository URL. Use the environment variable $GITHUB_REPO.\n"
         )
+    
+    # Load Tenant Config From Vault
+    tenant_config = {}
+    try:
+        with open("tenant_vault.json", "r") as f:
+            vault = json.load(f)
+            tenant_config = vault.get(team_id, {}) 
+    except FileNotFoundError:
+        pass # Fails gracefully if the file isn't created yet
 
     # CONCURRENCY CHECK: Intercept identical tickets
     if ticket_id in active_tickets:
@@ -642,7 +662,7 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
     active_tickets.add(ticket_id)
     
     # Offload the blocking AI execution to a background thread
-    background_tasks.add_task(process_ticket_with_lock, ticket_id, human_input)
+    background_tasks.add_task(process_ticket_with_lock, ticket_id, human_input, tenant_config)
 
     # Return immediately so Linear doesn't timeout the webhook!
     return {"status": "AI Team Dispatched/Resumed in background", "ticket": ticket_id}

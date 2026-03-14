@@ -7,6 +7,7 @@ from e2b_code_interpreter import Sandbox
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
+import shlex
 
 # Create schemas to hide the 'workspace' parameter from the LLM
 class TerminalInput(BaseModel):
@@ -25,17 +26,24 @@ class GitHubPRInput(BaseModel):
     pr_title: str = Field(description="PR Title")
     pr_body: str = Field(description="PR Body")
 
+class ManageDevServerInput(BaseModel):
+    action: str = Field(description="'start', 'logs', or 'stop'")
+    command: str = Field(description="The server command (e.g., 'npm run dev'). Only needed for 'start'.", default="")
+
+class InspectFrontendInput(BaseModel):
+    url: str = Field(description="The local URL to inspect, e.g. http://localhost:5000")
+
 def _parse_github_time(ts_str: str) -> datetime:
     """Safely converts a GitHub ISO 8601 string to a datetime object."""
     if not ts_str:
         return None
     return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
 
-def get_latest_pr(ticket_id: str) -> dict:
+def get_latest_pr(ticket_id: str, github_token: str = None, repo_full: str = None) -> dict:
     """Fetches the latest PR for the ticket and returns its branch and timestamp."""
-    github_token = os.environ.get("GITHUB_TOKEN")
-    repo_full = os.environ.get("GITHUB_REPO")
-    
+    github_token = github_token or os.environ.get("GITHUB_TOKEN")
+    repo_full = repo_full or os.environ.get("GITHUB_REPO")
+
     if not github_token or not repo_full:
         return None
         
@@ -57,11 +65,11 @@ def get_latest_pr(ticket_id: str) -> dict:
                 }
     return None
 
-def get_wip_branch(ticket_id: str) -> dict:
+def get_wip_branch(ticket_id: str, github_token: str = None, repo_full: str = None) -> dict:
     """Fetches the WIP recovery branch for the ticket and returns its timestamp."""
-    github_token = os.environ.get("GITHUB_TOKEN")
-    repo_full = os.environ.get("GITHUB_REPO")
-    
+    github_token = github_token or os.environ.get("GITHUB_TOKEN")
+    repo_full = repo_full or os.environ.get("GITHUB_REPO")
+
     if not github_token or not repo_full:
         return None
         
@@ -105,8 +113,11 @@ def get_wip_branch(ticket_id: str) -> dict:
         
     return None
 
-def get_main_branch_timestamp(repo_full: str, github_token: str):
+def get_main_branch_timestamp(github_token: str = None, repo_full: str = None) -> str:
     """Fetches the timestamp of the latest commit on the main branch."""
+    github_token = github_token or os.environ.get("GITHUB_TOKEN")
+    repo_full = repo_full or os.environ.get("GITHUB_REPO")
+
     if not github_token or not repo_full:
         return None
         
@@ -122,17 +133,17 @@ def get_main_branch_timestamp(repo_full: str, github_token: str):
         return _parse_github_time(ts_str)
     return None
 
-def get_best_resume_branch(ticket_id: str) -> dict:
+def get_best_resume_branch(ticket_id: str, github_token: str = None, repo_full: str = None) -> dict:
     """
     Races main, open PRs, and WIP branches against each other.
     Whichever was updated most recently wins.
     """
-    github_token = os.environ.get("GITHUB_TOKEN")
-    repo_full = os.environ.get("GITHUB_REPO")
+    github_token = github_token or os.environ.get("GITHUB_TOKEN")
+    repo_full = repo_full or os.environ.get("GITHUB_REPO")
 
-    pr_info = get_latest_pr(ticket_id)
-    wip_info = get_wip_branch(ticket_id)
-    main_ts = get_main_branch_timestamp(repo_full, github_token)
+    pr_info = get_latest_pr(ticket_id, github_token=github_token, repo_full=repo_full)
+    wip_info = get_wip_branch(ticket_id, github_token=github_token, repo_full=repo_full)
+    main_ts = get_main_branch_timestamp(github_token=github_token, repo_full=repo_full)
 
     candidates = []
     
@@ -188,16 +199,28 @@ def run_terminal_command(command: str, config: RunnableConfig) -> str:
             "echo -e 'node_modules/\\nvenv/\\n.venv/\\n__pycache__/\\n*.pyc\\n.env\\n.next/\\nbuild/\\ndist/' >> .gitignore;"
             "sort -u .gitignore -o .gitignore;"
         )
-        command = f"{gitignore_safeguard}\n{command}"
+        command = f"{command}\n{gitignore_safeguard}"
+    
+    # Extract the specific tenant's config
+    tenant_config = config.get("configurable", {}).get("tenant_config", {})
+    
+    # Fallback to os.environ ONLY for local dev/testing
+    github_token = tenant_config.get("github_token") or os.environ.get("GITHUB_TOKEN")
+    github_repo = tenant_config.get("github_repo") or os.environ.get("GITHUB_REPO")
+    client_secrets = tenant_config.get("secrets", {})
+
+    # Merge everything into the secure terminal environment
+    tool_envs = {
+        "GITHUB_TOKEN": github_token,
+        "GITHUB_REPO": github_repo,
+        **client_secrets
+    }
 
     try:
         # We execute the modified command string in the E2B sandbox
         execution = workspace.commands.run(
             command,
-            envs={
-                "GITHUB_TOKEN": os.environ.get("GITHUB_TOKEN"),
-                "GITHUB_REPO": os.environ.get("GITHUB_REPO"),
-            },
+            envs=tool_envs,
             timeout=120
         )
         
@@ -244,15 +267,17 @@ def write_file(file_path: str, content: str, config: RunnableConfig) -> str:
         return f"Error writing file: {str(e)}"
 
 @tool
-def update_linear_ticket(issue_id: str, message: str) -> str:
+def update_linear_ticket(issue_id: str, message: str, config: RunnableConfig) -> str:
     """
     Adds a comment to an active Linear ticket. 
     Use this to notify the human supervisor when a PR is ready with a Preview URL, 
     or if the AI team is blocked and needs help.
     """
-    api_key = os.environ.get("LINEAR_API_KEY")
+    tenant_config = config.get("configurable", {}).get("tenant_config", {})
+    api_key = tenant_config.get("linear_api_key") or os.environ.get("LINEAR_API_KEY")
+    
     if not api_key:
-        return "Error: LINEAR_API_KEY is missing."
+        return "Error: LINEAR_API_KEY is missing in tenant configuration."
 
     url = "https://api.linear.app/graphql"
     headers = {
@@ -289,8 +314,10 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
     if not workspace:
         return "Error: No active sandbox found in configuration."
     
-    github_token = os.environ.get("GITHUB_TOKEN")
-    repo_full = os.environ.get("GITHUB_REPO") 
+    # Extract specific tenant's GitHub credentials
+    tenant_config = config.get("configurable", {}).get("tenant_config", {})
+    github_token = tenant_config.get("github_token") or os.environ.get("GITHUB_TOKEN")
+    repo_full = tenant_config.get("github_repo") or os.environ.get("GITHUB_REPO")
     
     if not github_token or not repo_full:
         return "Error: GITHUB_TOKEN or GITHUB_REPO environment variable is missing."
@@ -304,12 +331,15 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
     repo_folder = repo_full.split("/")[-1].replace(".git", "")
 
     # This calls the same function that main.py uses to check for PRs
-    existing_pr = get_latest_pr(ticket_id)
+    existing_pr = get_latest_pr(ticket_id, github_token=github_token, repo_full=repo_full)
 
     if existing_pr:
         # PATH A: Update Existing PR
         active_branch = config.get("configurable", {}).get("active_resume_branch")
         
+        # Add the prefix dynamically for this path
+        tool_envs["COMMIT_MSG"] = f"Update: {commit_message}"
+
         # We push the current working state (HEAD) directly to the PR branch.
         git_commands = f"""
         cd {repo_folder}
@@ -318,7 +348,7 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
         
         git checkout {active_branch}
         git add .
-        git commit -m "Update: {commit_message}" || echo "nothing to commit"
+        git commit -m "$COMMIT_MSG" || echo "nothing to commit"
         git push https://$GITHUB_TOKEN@github.com/{repo_full}.git HEAD:refs/heads/{active_branch} --force
         """
         
@@ -334,14 +364,16 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
         # PATH B: Create New PR
         new_branch = config.get("configurable", {}).get("pr_branch")
         
+        # Just use the raw message for this path
+        tool_envs["COMMIT_MSG"] = commit_message
+
         git_commands = f"""
         cd {repo_folder}
         git config --global user.email "ai@agency.dev"
         git config --global user.name "AI DevOps"
         git checkout -b {new_branch}
         git add .
-        git commit -m "{commit_message}"
-        # Use the variable explicitly here too
+        git commit -m "$COMMIT_MSG"
         git push https://$GITHUB_TOKEN@github.com/{repo_full}.git {new_branch}
         """
         
@@ -386,14 +418,14 @@ def sync_wip_commit(commit_message: str, config: RunnableConfig) -> str:
     if not workspace:
         return "Error: No active sandbox found in configuration."
         
-    github_token = os.environ.get("GITHUB_TOKEN")
-    repo_full = os.environ.get("GITHUB_REPO")
+    # Extract specific tenant's GitHub credentials
+    tenant_config = config.get("configurable", {}).get("tenant_config", {})
+    github_token = tenant_config.get("github_token") or os.environ.get("GITHUB_TOKEN")
+    repo_full = tenant_config.get("github_repo") or os.environ.get("GITHUB_REPO")
+    wip_branch = config.get("configurable", {}).get("wip_branch")
     
     if not github_token or not repo_full:
-        return "Error: GITHUB_TOKEN or GITHUB_REPO environment variable is missing."
-
-    # Standard temporary backup branch name
-    wip_branch = config.get("configurable", {}).get("wip_branch")
+        return "Error: Missing GITHUB_TOKEN or GITHUB_REPO in tenant configuration."
 
     # Extract repo folder
     repo_folder = repo_full.split("/")[-1].replace(".git", "")
@@ -406,7 +438,7 @@ def sync_wip_commit(commit_message: str, config: RunnableConfig) -> str:
     git config --global user.name "AI Developer"
     
     git add .
-    git commit -m "WIP Sync: {commit_message}" || echo "Nothing to commit"
+    git commit -m "$COMMIT_MSG" || echo "Nothing to commit"
     
     # Force push the current local state (HEAD) directly to the remote WIP branch
     git push https://$GITHUB_TOKEN@github.com/{repo_full}.git HEAD:refs/heads/{wip_branch} --force
@@ -415,7 +447,8 @@ def sync_wip_commit(commit_message: str, config: RunnableConfig) -> str:
     try:
         execution = workspace.commands.run(git_commands, envs={
             "GITHUB_TOKEN": github_token,
-            "GITHUB_REPO": repo_full  # Add this line
+            "GITHUB_REPO": repo_full,
+            "COMMIT_MSG": f"WIP Sync: {commit_message}"
         })
 
         # Properly evaluate standard bash errors
@@ -426,3 +459,110 @@ def sync_wip_commit(commit_message: str, config: RunnableConfig) -> str:
         
     except Exception as e:
         return f"WIP Sync execution failed: {str(e)}"
+
+@tool(args_schema=ManageDevServerInput)
+def manage_dev_server(action: str, command: str, config: RunnableConfig) -> str:
+    """Manages background development servers. Use this to start a server without timing out, check its logs, and stop it."""
+    workspace = config.get("configurable", {}).get("sandbox")
+    if not workspace: return "Error: No active sandbox."
+    
+    # Consistent file paths
+    log_file = "/tmp/server_logs.txt"
+    pid_file = "/tmp/server_pid.txt"
+
+    if action == "start":
+        if not command: return "Error: Must provide a command."
+        
+        # Clean up old state first
+        workspace.commands.run(f"rm {log_file} {pid_file} || echo 'clean'")
+
+        # Extract tenant secrets for the background server
+        tenant_config = config.get("configurable", {}).get("tenant_config", {})
+        client_secrets = tenant_config.get("secrets", {})
+
+        try:
+            # Force write the initial line BEFORE starting the server
+            workspace.files.write(log_file, "=== SERVER INITIALIZING IN BACKGROUND ===\nWait at least 20s for logs to appear...\n")
+
+            # Native E2B background execution.
+            # We must manually redirect stdout/stderr to a file within the command if we want to read the logs later.
+            # Use '>>' to APPEND to the log file so we don't erase the line we just wrote
+            secure_command = f"{command} >> {log_file} 2>&1"
+            
+            # Inject only THIS client's secrets
+            process = workspace.commands.run(
+                f"bash -c {shlex.quote(secure_command)}", 
+                background=True,
+                envs=client_secrets 
+            )
+            
+            # Record the PID
+            workspace.files.write(pid_file, str(process.pid))
+            
+            # URGENT: The instruction must tell the agent to wait.
+            return f"Server started in background with PID {process.pid}. URGENT: Do not check 'logs' or test the port in the same turn. Perform other tasks ( exploration/edits) for at least 2 turns to allow initialization."
+            
+        except Exception as e:
+            return f"Failed to start server: {str(e)}"
+    
+    elif action == "logs":
+        # Check if file exists, then tail.
+        cmd = f"[ -f {log_file} ] && tail -n 100 {log_file} || echo 'No log file found yet. Wait longer.'"
+        res = workspace.commands.run(f"bash -c {shlex.quote(cmd)}")
+        return f"Server Logs:\n{res.stdout or res.stderr}"
+        
+    elif action == "stop":
+        # More aggressive cleanup for Java/Firebase suits.
+        cleanup_cmd = f"""
+        echo "Stopping parent process recorded in {pid_file}..."
+        PID=$(cat {pid_file} || echo "")
+        if [ ! -z "$PID" ]; then kill $PID || kill -9 $PID || echo "PID dead"; fi
+        
+        echo "Aggressively cleaning common Firebase ports (8080, 5000, 5001)..."
+        # Kill by port
+        fuser -k 8080/tcp 5000/tcp 5001/tcp || echo "ports clean"
+        rm {pid_file} {log_file}
+        """
+        workspace.commands.run(f"bash -c {shlex.quote(cleanup_cmd)}")
+        return "Server stopped."
+    
+    return "Invalid action."
+
+@tool(args_schema=InspectFrontendInput)
+def inspect_frontend(url: str, config: RunnableConfig) -> str:
+    """Opens a headless browser, navigates to the URL, and returns console errors and network failures."""
+    workspace = config.get("configurable", {}).get("sandbox")
+    if not workspace:
+        return "Error: No active sandbox."
+    
+    # Write a quick Playwright script to the temp directory
+    script = f"""
+    const {{ chromium }} = require('playwright');
+    (async () => {{
+        try {{
+            const browser = await chromium.launch({{ args: ['--no-sandbox'] }});
+            const page = await browser.newPage();
+            const errors = [];
+            
+            page.on('console', msg => {{ 
+                if(msg.type() === 'error' || msg.type() === 'warning') errors.push(`[${{msg.type().toUpperCase()}}] ${{msg.text()}}`); 
+            }});
+            page.on('pageerror', err => errors.push(`[PAGE CRASH] ${{err.message}}`));
+            
+            await page.goto('{url}', {{ waitUntil: 'networkidle', timeout: 15000 }});
+            
+            console.log("=== BROWSER DIAGNOSTICS ===");
+            console.log(errors.length ? errors.join('\\n') : "SUCCESS: No console errors detected.");
+            await browser.close();
+        }} catch (e) {{
+            console.log("Failed to inspect URL: " + e.message);
+        }}
+    }})();
+    """
+    workspace.files.write("/tmp/inspect.js", script)
+    
+    # Quietly install playwright if it's missing, then run the script
+    workspace.commands.run("cd /tmp && npm install playwright")
+    res = workspace.commands.run("node /tmp/inspect.js")
+    
+    return res.stdout or res.stderr
