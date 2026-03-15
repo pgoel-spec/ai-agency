@@ -58,8 +58,8 @@ build/Release
 .dataconnect
 
 sa-key*
-Dockerfile
-dockerfile
+/Dockerfile
+/dockerfile
 test.py
 output
 output/
