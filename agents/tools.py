@@ -133,7 +133,7 @@ def get_main_branch_timestamp(github_token: str = None, repo_full: str = None) -
         return _parse_github_time(ts_str)
     return None
 
-def get_best_resume_branch(ticket_id: str, github_token: str = None, repo_full: str = None) -> dict:
+def get_best_resume_branch(ticket_id: str, github_token: str, repo_full: str) -> dict:
     """
     Races main, open PRs, and WIP branches against each other.
     Whichever was updated most recently wins.
@@ -342,7 +342,10 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
 
         # We push the current working state (HEAD) directly to the PR branch.
         git_commands = f"""
-        cd {repo_folder}
+        GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
+        if [ -z "$GIT_DIR" ]; then exit 1; fi
+        cd "$(dirname "$GIT_DIR")"
+        
         git config --global user.email "ai@agency.dev"
         git config --global user.name "AI DevOps"
         
@@ -368,7 +371,10 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
         tool_envs["COMMIT_MSG"] = commit_message
 
         git_commands = f"""
-        cd {repo_folder}
+        GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
+        if [ -z "$GIT_DIR" ]; then exit 1; fi
+        cd "$(dirname "$GIT_DIR")"
+        
         git config --global user.email "ai@agency.dev"
         git config --global user.name "AI DevOps"
         git checkout -b {new_branch}
@@ -433,7 +439,13 @@ def sync_wip_commit(commit_message: str, config: RunnableConfig) -> str:
     # The script uses HEAD:refs/heads/... to push the current state to the remote WIP branch
     # without altering the agent's current local branch checkout.
     git_commands = f"""
-    cd {repo_folder}
+    GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
+    if [ -z "$GIT_DIR" ]; then
+        echo "Error: No git repository found in the workspace. Did you clone it?"
+        exit 1
+    fi
+    cd "$(dirname "$GIT_DIR")"
+    
     git config --global user.email "ai@agency.dev"
     git config --global user.name "AI Developer"
     

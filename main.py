@@ -1,5 +1,6 @@
 import os
 import requests
+import asyncio
 from dotenv import load_dotenv
 from e2b_code_interpreter import Sandbox
 from agents.graph import app as agent_team
@@ -19,6 +20,16 @@ app = FastAPI()
 @app.on_event("startup")
 def on_startup():
     init_db()
+
+def read_tenant_vault(team_id: str) -> dict:
+    """Synchronous helper to read the vault file."""
+    try:
+        with open("tenant_vault.json", "r") as f:
+            import json
+            vault = json.load(f)
+            return vault.get(team_id, {}) 
+    except FileNotFoundError:
+        return {} # Fails gracefully if the file isn't created yet
 
 def get_recent_linear_comments(ticket_id: str) -> str:
     """
@@ -70,8 +81,17 @@ def process_ticket(ticket_id: str, human_input: str, tenant_config: dict):
     FastAPI automatically runs standard 'def' background tasks in a separate thread pool,
     so it won't block the main asyncio event loop.
     """
-    # 4. Create a fresh sandbox for this run (with a 15 min timeout)
-    workspace = Sandbox.create(timeout=900)
+    # Dynamically route the sandbox environment based on tenant architecture
+    target_template = tenant_config.get("e2b_template")
+    
+    # Create a fresh sandbox for this run (with a 15 min timeout)
+    if target_template:
+        print(f"\n[SYSTEM]: Booting E2B Sandbox using custom template: {target_template}")
+        workspace = Sandbox.create(template=target_template, timeout=900)
+    else:
+        print(f"\n[SYSTEM]: Booting default E2B Sandbox")
+        workspace = Sandbox.create(timeout=900)
+    
     config = {
         "configurable": {
             "thread_id": ticket_id,
@@ -149,7 +169,11 @@ def process_ticket(ticket_id: str, human_input: str, tenant_config: dict):
 
     try:
         # Initial Log: Capture the starting human input
-        best_branch_info = get_best_resume_branch(ticket_id)
+        best_branch_info = get_best_resume_branch(
+            ticket_id=ticket_id, 
+            github_token=tenant_config.get("github_token"),
+            repo_full=tenant_config.get("github_repo")
+        )
         short_time = datetime.now().strftime("%b %d, %H:%M")
 
         if best_branch_info:
@@ -641,14 +665,8 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
             f"IMPORTANT: Do not guess or invent a repository URL. Use the environment variable $GITHUB_REPO.\n"
         )
     
-    # Load Tenant Config From Vault
-    tenant_config = {}
-    try:
-        with open("tenant_vault.json", "r") as f:
-            vault = json.load(f)
-            tenant_config = vault.get(team_id, {}) 
-    except FileNotFoundError:
-        pass # Fails gracefully if the file isn't created yet
+    # Load Tenant Config From Vault asynchronously without blocking the event loop
+    tenant_config = await asyncio.to_thread(read_tenant_vault, team_id)
 
     # CONCURRENCY CHECK: Intercept identical tickets
     if ticket_id in active_tickets:

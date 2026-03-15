@@ -572,7 +572,7 @@ def manager_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
         for tool in last_ai_msg.tool_calls:
             
             if tool["name"] == "update_linear_ticket":
-                result = update_linear_ticket.invoke(tool["args"])
+                result = update_linear_ticket.invoke(tool["args"], config=config)
                 messages_to_add.append(ToolMessage(
                     content=str(result), 
                     name=tool["name"], 
@@ -643,8 +643,8 @@ def developer_node(state: AgencyState) -> dict:
         "YOUR INSTRUCTIONS:\n"
         "1. Work through the process step-by-step. After every tool call, analyze the output before deciding your next move. You can call `write_file` and immediately call `sync_wip_commit` in the exact same response to save time.\n"
         #"1. Work through the process intelligently. You are encouraged to BATCH multiple tool calls in a single turn whenever possible to save time. For example, you can call `write_file` and immediately call `sync_wip_commit` in the exact same response.\n"
-        "2. Initialization & Dependencies: If the repository isn't cloned yet, clone it using: `git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git`. Use `cd <folder_name>` to enter the repository before running git commands or modifying files. CRITICAL: Whenever you clone a fresh repo or check out a branch, you MUST actively check for dependency files (e.g., `package.json`, `requirements.txt`, `pom.xml`). If they exist, you must run the appropriate install command (e.g., `npm install`, `pip install -r requirements.txt`) in that specific directory before attempting to run any tests or start servers.\n"
-        "3. Codebase Exploration: Do NOT guess file paths. Your first priority is to build a 'System Map':\n"
+        "2. Initialization & Dependencies: If the repository isn't cloned yet, clone it using: `git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git`. Immediately run `ls` to observe the actual folder name created by git. Use `cd <folder_name>` to enter the repository before running git commands or modifying files. CRITICAL: Whenever you clone a fresh repo or check out a branch, you MUST actively check for dependency files (e.g., `package.json`, `requirements.txt`, `pom.xml`). If they exist, you must run the appropriate install command (e.g., `npm install`, `pip install -r requirements.txt`) in that specific directory before attempting to run any tests or start servers.\n"
+        "3. Codebase Exploration: Do NOT guess file paths. If you just cloned the code, all files are located inside the folder you observed in the previous step. When using `read_file` or `write_file`, you must include that folder name at the start of your path. Your first priority is to build a 'System Map':\n"
         "   - Run `ls -R` to understand the full directory hierarchy.\n"
         "   - Identify and read the 'Source of Truth' files: Look for dependency manifests (e.g., package.json, requirements.txt, pyproject.toml) and core schemas or state definitions.\n"
         "   - Locate the main Entry Points (e.g., main.py, index.js, app.py, or Dockerfiles) to understand the execution flow.\n"
@@ -683,7 +683,8 @@ def developer_node(state: AgencyState) -> dict:
         "DIRECTORY & FIREBASE RULES:\n"
         "1. NEVER move, create, or modify `firebase.json` or `.firebaserc` inside a subfolder (like `public`, `src`, or `dist`).\n"
         "2. Firebase configuration files MUST always remain at the absolute root of the repository.\n"
-        "3. Only place your actual frontend code (HTML, CSS, JS) inside the `public` directory. Make sure `firebase.json` points its hosting 'public' key to this folder.\n\n"
+        "3. Only place your actual frontend code (HTML, CSS, JS) inside the `public` directory. Make sure `firebase.json` points its hosting 'public' key to this folder.\n"
+        "4. When configuring `firebase.json` rewrites, you MUST place specific function routes (e.g., `/api/**`) BEFORE any catch-all frontend routes (e.g., `**` for Single Page Apps).\n\n"
         
         "RESUMING WORK (AFTER Human-in-the-Loop or Crash):\n"
         "If the Manager routes a task back to you or overrides your system state with an active branch:\n"
@@ -729,10 +730,10 @@ def developer_node(state: AgencyState) -> dict:
     response = safe_invoke_llm(developer_llm, full_prompt)
 
     # DEBUGGING: Print the exact finish reason and raw metadata to your terminal
-    print("--- DEBUG INFO ---")
-    print("FINISH REASON:", getattr(response, "response_metadata", {}).get("finish_reason", "UNKNOWN"))
-    print("RAW METADATA:", getattr(response, "response_metadata", {}))
-    print("------------------")
+    # print("--- DEBUG INFO ---")
+    # print("FINISH REASON:", getattr(response, "response_metadata", {}).get("finish_reason", "UNKNOWN"))
+    # print("RAW METADATA:", getattr(response, "response_metadata", {}))
+    # print("------------------")
 
     # Extract the exact token usage from Google's response metadata
     tokens_used = 0
