@@ -267,16 +267,22 @@ def write_file(file_path: str, content: str, config: RunnableConfig) -> str:
         return f"Error writing file: {str(e)}"
 
 @tool
-def update_linear_ticket(issue_id: str, message: str, config: RunnableConfig) -> str:
+def update_linear_ticket(message: str, config: RunnableConfig) -> str:
     """
     Adds a comment to an active Linear ticket. 
     Use this to notify the human supervisor when a PR is ready with a Preview URL, 
     or if the AI team is blocked and needs help.
     """
-    tenant_config = config.get("configurable", {}).get("tenant_config", {})
-    api_key = tenant_config.get("linear_api_key") or os.environ.get("LINEAR_API_KEY")
+    # Securely extract the ticket ID from the system config
+    ticket_id = config.get("configurable", {}).get("ticket_id")
     
-    if not api_key:
+    if not ticket_id:
+        return "Error: System failed to inject the active ticket ID."
+    
+    tenant_config = config.get("configurable", {}).get("tenant_config", {})
+    linear_api_key = tenant_config.get("linear_api_key") or os.environ.get("LINEAR_API_KEY")
+    
+    if not linear_api_key:
         return "Error: LINEAR_API_KEY is missing in tenant configuration."
 
     url = "https://api.linear.app/graphql"
@@ -322,6 +328,8 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
     if not github_token or not repo_full:
         return "Error: GITHUB_TOKEN or GITHUB_REPO environment variable is missing."
     
+    active_resume_branch = config.get("configurable", {}).get("active_resume_branch", "main")
+    
     # Define a clean envs dict to reuse
     tool_envs = {
         "GITHUB_TOKEN": github_token,
@@ -335,7 +343,6 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
 
     if existing_pr:
         # PATH A: Update Existing PR
-        active_branch = config.get("configurable", {}).get("active_resume_branch")
         
         # Add the prefix dynamically for this path
         tool_envs["COMMIT_MSG"] = f"Update: {commit_message}"
@@ -343,23 +350,32 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
         # We push the current working state (HEAD) directly to the PR branch.
         git_commands = f"""
         GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
-        if [ -z "$GIT_DIR" ]; then exit 1; fi
+        if [ -z "$GIT_DIR" ]; then 
+            echo "Empty sandbox detected. Cloning fresh copy..."
+            cd /home/user
+            git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git
+            GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
+            if [ -z "$GIT_DIR" ]; then exit 1; fi
+        fi
         cd "$(dirname "$GIT_DIR")"
+        
+        # Ensure we are on the exact WIP branch before executing PR logic
+        git fetch origin
+        git checkout {active_resume_branch}
         
         git config --global user.email "ai@agency.dev"
         git config --global user.name "AI DevOps"
         
-        git checkout {active_branch}
         git add .
         git commit -m "$COMMIT_MSG" || echo "nothing to commit"
-        git push https://$GITHUB_TOKEN@github.com/{repo_full}.git HEAD:refs/heads/{active_branch} --force
+        git push https://$GITHUB_TOKEN@github.com/{repo_full}.git HEAD:refs/heads/{active_resume_branch} --force
         """
         
         try:
             execution = workspace.commands.run(git_commands, envs=tool_envs)
             if execution.error and "nothing to commit" not in execution.stdout:
                 return f"Git Push Error:\nSTDOUT: {execution.stdout}\nSTDERR: {execution.stderr}"
-            return f"Successfully updated the existing Pull Request on branch '{active_branch}'!"
+            return f"Successfully updated the existing Pull Request on branch '{active_resume_branch}'!"
         except Exception as e:
             return f"Git Execution failed: {str(e)}"
             
@@ -372,8 +388,18 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
 
         git_commands = f"""
         GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
-        if [ -z "$GIT_DIR" ]; then exit 1; fi
+        if [ -z "$GIT_DIR" ]; then 
+            echo "Empty sandbox detected. Cloning fresh copy..."
+            cd /home/user
+            git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git
+            GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
+            if [ -z "$GIT_DIR" ]; then exit 1; fi
+        fi
         cd "$(dirname "$GIT_DIR")"
+        
+        # Ensure we are on the exact WIP branch before executing PR logic
+        git fetch origin
+        git checkout {active_resume_branch}
         
         git config --global user.email "ai@agency.dev"
         git config --global user.name "AI DevOps"
@@ -496,10 +522,14 @@ def manage_dev_server(action: str, command: str, config: RunnableConfig) -> str:
             # Force write the initial line BEFORE starting the server
             workspace.files.write(log_file, "=== SERVER INITIALIZING IN BACKGROUND ===\nWait at least 20s for logs to appear...\n")
 
+            # Intelligently find the directory containing firebase.json
+            cd_cmd = "cd $(find /home/user -maxdepth 3 -name firebase.json -printf '%h\\n' | head -n 1) || cd /home/user/public-ledger"
+            
             # Native E2B background execution.
             # We must manually redirect stdout/stderr to a file within the command if we want to read the logs later.
             # Use '>>' to APPEND to the log file so we don't erase the line we just wrote
-            secure_command = f"{command} >> {log_file} 2>&1"
+            # Group the commands inside { } so that ALL output (even from the cd command) is captured in the log file.
+            secure_command = f"{{ {cd_cmd} && {command}; }} >> {log_file} 2>&1"
             
             # Inject only THIS client's secrets
             process = workspace.commands.run(
@@ -511,8 +541,32 @@ def manage_dev_server(action: str, command: str, config: RunnableConfig) -> str:
             # Record the PID
             workspace.files.write(pid_file, str(process.pid))
             
-            # URGENT: The instruction must tell the agent to wait.
-            return f"Server started in background with PID {process.pid}. URGENT: Do not check 'logs' or test the port in the same turn. Perform other tasks ( exploration/edits) for at least 2 turns to allow initialization."
+            # Synchronous Polling Loop
+            print(f"[SYSTEM] Waiting for server (PID {process.pid}) to boot...")
+            max_wait_time = 30
+            booted = False
+            
+            for _ in range(max_wait_time // 2):
+                time.sleep(2) # Pause the Python thread, delaying the LLM's next turn
+                
+                # Read the current state of the logs from E2B
+                current_logs_result = workspace.commands.run(f"tail -n 50 {log_file}")
+                current_logs = current_logs_result.stdout or ""
+                
+                # Check for Firebase success/failure signatures
+                if "All emulators ready" in current_logs or "listening on port" in current_logs:
+                    booted = True
+                    break
+                if any(err in current_logs for err in ["Failed to start", "port taken", "Error:", "No such file", "command not found"]):
+                    break # Boot failed, break early to show the agent the error
+                    
+            # Fetch final logs to return to the agent immediately
+            final_logs = workspace.commands.run(f"tail -n 50 {log_file}").stdout
+            
+            if booted:
+                return f"SUCCESS: Server started securely in the background. Initial Boot Logs:\n{final_logs}"
+            else:
+                return f"WARNING: Server failed to start or crashed. Review the logs to diagnose the issue:\n{final_logs}"
             
         except Exception as e:
             return f"Failed to start server: {str(e)}"
@@ -524,19 +578,22 @@ def manage_dev_server(action: str, command: str, config: RunnableConfig) -> str:
         return f"Server Logs:\n{res.stdout or res.stderr}"
         
     elif action == "stop":
-        # More aggressive cleanup for Java/Firebase suits.
         cleanup_cmd = f"""
         echo "Stopping parent process recorded in {pid_file}..."
         PID=$(cat {pid_file} || echo "")
-        if [ ! -z "$PID" ]; then kill $PID || kill -9 $PID || echo "PID dead"; fi
+        if [ ! -z "$PID" ]; then kill -9 $PID || echo "PID dead"; fi
         
-        echo "Aggressively cleaning common Firebase ports (8080, 5000, 5001)..."
-        # Kill by port
-        fuser -k 8080/tcp 5000/tcp 5001/tcp || echo "ports clean"
-        rm {pid_file} {log_file}
+        echo "Aggressively cleaning Firebase ports and Zombie Java processes..."
+        fuser -k 8080/tcp 5000/tcp 5001/tcp 4000/tcp 4400/tcp || true
+        
+        # Kill any lingering Java (Firebase Emulator) or Node processes
+        pkill -9 -f java || true
+        pkill -9 -f firebase || true
+        
+        rm -f {pid_file} {log_file}
         """
         workspace.commands.run(f"bash -c {shlex.quote(cleanup_cmd)}")
-        return "Server stopped."
+        return "Server and all related ports forcefully stopped and cleaned."
     
     return "Invalid action."
 

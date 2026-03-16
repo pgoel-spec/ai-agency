@@ -188,6 +188,7 @@ def process_ticket(ticket_id: str, human_input: str, tenant_config: dict):
 
             # --- Update Config to use the Shared Memory ID ---
             config["configurable"]["thread_id"] = session_id
+            config["configurable"]["ticket_id"] = ticket_id
             config["configurable"]["wip_branch"] = f"wip-recovery-{session_id}"
             config["configurable"]["pr_branch"] = f"feature-{session_id}"
             config["configurable"]["active_resume_branch"] = branch_name # So we know what to checkout
@@ -217,6 +218,9 @@ def process_ticket(ticket_id: str, human_input: str, tenant_config: dict):
             current_state = agent_team.get_state(config)
             has_history = bool(current_state.values)
 
+            # Log the webhook immediately so it appears at the top of the UI timeline, before the AI streams.
+            log_activity(ticket_id, "human", human_input, node_name="Webhook", session_id=session_id)
+
             if has_history:
                 # --- WIP: CONTEXT REHYDRATION (Checking the Real World) ---
                 # recent_comments = get_recent_linear_comments(ticket_id)
@@ -239,8 +243,12 @@ def process_ticket(ticket_id: str, human_input: str, tenant_config: dict):
             session_timestamp = int(time.time())
             session_id = f"{ticket_id}-{session_timestamp}"
 
+            # Log the webhook immediately so it appears at the top of the UI timeline, before the AI streams.
+            log_activity(ticket_id, "human", human_input, node_name="Webhook", session_id=session_id)
+
             # --- Set up the shared config ---
             config["configurable"]["thread_id"] = session_id
+            config["configurable"]["ticket_id"] = ticket_id
             config["configurable"]["wip_branch"] = f"wip-recovery-{session_id}"
             config["configurable"]["pr_branch"] = f"feature-{session_id}"
             config["configurable"]["active_resume_branch"] = "main"
@@ -273,8 +281,6 @@ def process_ticket(ticket_id: str, human_input: str, tenant_config: dict):
             # This ensures a clean slate for the new sandbox environment.
             # ==========================================
             stream_and_log(initial_state, config, ticket_id, session_id)
-        
-        log_activity(ticket_id, "human", human_input, node_name="Webhook", session_id=session_id)
     
     finally:
         # Always clean up the sandbox to save compute!
@@ -417,15 +423,15 @@ async def api_get_session_logs(ticket_id: str, session_id: str):
 # 2. THE HTML UI (Auto-Polling Viewer)
 # ==========================================
 def get_log_viewer_html(page_title: str, api_endpoint: str):
-    """Generates an HTML page that automatically polls the API for new logs."""
+    """Generates an HTML page with a Sidebar, View Filters, and Copy features."""
     return f"""
     <html>
         <head>
             <title>{page_title} - AI Agency</title>
             <style>
-                body {{ font-family: 'Courier New', Courier, monospace; background-color: #1e1e1e; color: #d4d4d4; padding: 0 10px; margin: 0; }}
+                body {{ font-family: 'Courier New', Courier, monospace; background-color: #1e1e1e; color: #d4d4d4; margin: 0; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }}
                 
-                .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #444; padding: 6px 0; margin-bottom: 6px; position: sticky; top: 0; background-color: #1e1e1e; z-index: 10; }}
+                .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #444; padding: 6px 15px; background-color: #1e1e1e; z-index: 10; flex-shrink: 0; }}
                 .header-left {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
                 .header a {{ color: #4fc1ff; text-decoration: none; font-family: -apple-system, sans-serif; font-weight: 500; font-size: 0.85em; margin-right: 5px; }}
                 .header a:hover {{ text-decoration: underline; }}
@@ -433,17 +439,57 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                 .header-btn {{ background: #333; color: #fff; border: 1px solid #555; padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 0.8em; font-family: -apple-system, sans-serif; transition: 0.1s; }}
                 .header-btn:hover {{ background: #4fc1ff; color: #000; border-color: #4fc1ff; }}
                 
+                /* Filter Bar */
+                .filter-bar {{ background: #181818; padding: 6px 15px; border-bottom: 1px solid #333; display: flex; gap: 15px; font-family: -apple-system, sans-serif; font-size: 0.85em; flex-shrink: 0; }}
+                .filter-bar label {{ cursor: pointer; display: flex; align-items: center; gap: 4px; color: #aaa; }}
+                .filter-bar label:hover {{ color: #fff; }}
+                
+                /* Layout */
+                .layout {{ display: flex; flex: 1; overflow: hidden; }}
+                .main-content {{ flex: 1; overflow-y: auto; padding: 10px 15px; display: flex; flex-direction: column; gap: 4px; scroll-behavior: smooth; }}
+                
+                /* Sidebar */
+                .sidebar {{ width: 280px; background: #252526; border-right: 1px solid #444; display: flex; flex-direction: column; flex-shrink: 0; transition: width 0.3s ease; overflow: hidden; }}
+                .sidebar.collapsed {{ width: 40px; }}
+                
+                .sidebar-header {{ padding: 10px; font-family: -apple-system, sans-serif; font-weight: bold; font-size: 0.9em; border-bottom: 1px solid #444; color: #d4d4d4; background: #1e1e1e; display: flex; justify-content: space-between; align-items: center; white-space: nowrap; }}
+                
+                .sidebar.collapsed .sidebar-title {{ display: none; }}
+                .sidebar.collapsed .sidebar-header {{ justify-content: center; padding: 10px 0; }}
+                .sidebar.collapsed .sidebar-list {{ display: none; }}
+                
+                .sidebar-toggle-btn {{ background: none; border: none; color: #858585; cursor: pointer; font-size: 1.1em; padding: 0 5px; transition: color 0.2s; }}
+                .sidebar-toggle-btn:hover {{ color: #fff; }}
+
+                .sidebar-list {{ flex: 1; overflow-y: auto; padding: 10px; margin: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }}
+                
+                .checkpoint-item {{ font-family: -apple-system, sans-serif; padding: 8px; border-radius: 4px; background: #1e1e1e; cursor: pointer; font-size: 0.8em; color: #ccc; border-left: 4px solid transparent; transition: 0.1s; display: flex; flex-direction: column; gap: 4px; }}
+                .checkpoint-item:hover {{ background: #333; filter: brightness(1.2); }}
+                .checkpoint-time {{ font-family: monospace; font-size: 0.9em; color: #888; }}
+                
+                /* Checkpoint Colors */
+                .cp-human {{ border-left-color: #a855f7; }}
+                .cp-error {{ border-left-color: #f43f5e; }}
+                .cp-manager {{ border-left-color: #4fc1ff; }}
+
                 .controls {{ display: flex; align-items: center; gap: 8px; font-family: -apple-system, sans-serif; font-size: 0.8em; }}
                 .status-dot {{ height: 8px; width: 8px; background-color: #4ade80; border-radius: 50%; display: inline-block; box-shadow: 0 0 6px #4ade80; }}
                 
-                #log-container {{ display: flex; flex-direction: column; gap: 4px; padding-bottom: 20px; }}
-                .log-card {{ background: #252526; padding: 4px 6px; border-radius: 2px; border-left: 3px solid #4fc1ff; }}
+                /* Log Cards */
+                .log-card {{ background: #252526; padding: 4px 6px; border-radius: 2px; border-left: 3px solid #4fc1ff; transition: background-color 0.5s ease; }}
                 .log-card.error {{ border-left-color: #f43f5e; }}
                 .log-card.human {{ border-left-color: #a855f7; }}
+                
+                /* Flash Animation for when navigating from Sidebar */
+                .log-card.flash-highlight {{ animation: flashAnim 2s ease-out; }}
+                @keyframes flashAnim {{ 0% {{ background-color: #5a5a5a; }} 100% {{ background-color: #252526; }} }}
                 
                 .log-meta {{ font-size: 0.75em; color: #858585; margin-bottom: 2px; border-bottom: 1px dashed #333; padding-bottom: 2px; display: flex; justify-content: space-between; align-items: center; }}
                 .log-meta-left {{ display: flex; gap: 6px; align-items: center; }}
                 .log-meta-right {{ display: flex; align-items: center; gap: 10px; }}
+                
+                .copy-btn {{ background: none; border: 1px solid #555; color: #aaa; border-radius: 3px; cursor: pointer; font-family: -apple-system, sans-serif; font-size: 0.9em; padding: 1px 6px; transition: 0.1s; }}
+                .copy-btn:hover {{ background: #4fc1ff; color: #000; border-color: #4fc1ff; }}
                 
                 .token-container {{ display: flex; align-items: center; gap: 6px; background: #1e1e1e; padding: 2px 6px; border-radius: 3px; border: 1px solid #333; }}
                 .token-bar {{ width: 50px; height: 6px; background: #333; border-radius: 3px; overflow: hidden; }}
@@ -458,17 +504,23 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                 .toggle-btn {{ display: none; background: none; border: none; color: #4fc1ff; cursor: pointer; padding: 0; font-family: monospace; font-size: 1.1em; font-weight: bold; }}
                 .toggle-btn:hover {{ text-decoration: underline; }}
                 .log-card.expandable .toggle-btn {{ display: inline-block; }}
+
+                /* View Filters Logic */
+                body.hide-prompts .role-ai_prompt {{ display: none; }}
+                body.hide-tools .role-tool_output {{ display: none; }}
+                body.hide-raw .role-ai_raw_response {{ display: none; }}
+                body.hide-traces .role-system_trace {{ display: none; }}
             </style>
         </head>
         <body>
             <div class="header">
                 <div class="header-left">
                     <a href="/logs">← Dashboard</a>
-                    <h4 style="margin: 0 5px 0 0; color: #fff; font-size: 0.9em;">{page_title}</h4>
+                    <h4 style="margin: 0 10px 0 0; color: #fff; font-size: 0.9em;">{page_title}</h4>
                     <button class="header-btn" onclick="setAllCards(true)">Expand All</button>
                     <button class="header-btn" onclick="setAllCards(false)">Collapse All</button>
-                    <button class="header-btn" style="margin-left: 10px;" onclick="window.scrollTo(0, 0)">↑ Top</button>
-                    <button class="header-btn" onclick="window.scrollTo(0, document.documentElement.scrollHeight)">↓ Bottom</button>
+                    <button class="header-btn" style="margin-left: 10px;" onclick="document.querySelector('.main-content').scrollTo(0, 0)">↑ Top</button>
+                    <button class="header-btn" onclick="document.querySelector('.main-content').scrollTo(0, document.querySelector('.main-content').scrollHeight)">↓ Bottom</button>
                 </div>
                 <div class="controls">
                     <span id="status-text">Polling</span>
@@ -476,11 +528,34 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                 </div>
             </div>
 
-            <div id="log-container">
-                <div style="color: #858585; font-size: 0.8em;">Waiting for logs...</div>
+            <div class="filter-bar">
+                <strong style="color: #fff; margin-right: 5px;">View Filters:</strong>
+                <label><input type="checkbox" onchange="document.body.classList.toggle('hide-prompts', !this.checked)" checked> AI Prompts (Input)</label>
+                <label><input type="checkbox" onchange="document.body.classList.toggle('hide-tools', !this.checked)" checked> Tool Outputs</label>
+                <label><input type="checkbox" onchange="document.body.classList.toggle('hide-raw', !this.checked)"> Raw JSON Metadata</label>
+                <label><input type="checkbox" onchange="document.body.classList.toggle('hide-traces', !this.checked)"> System Traces</label>
+            </div>
+
+            <div class="layout">
+                <div class="sidebar" id="checkpoint-sidebar">
+                    <div class="sidebar-header">
+                        <span class="sidebar-title">Timeline</span>
+                        <button class="sidebar-toggle-btn" id="toggle-sidebar-btn" onclick="toggleSidebar()" title="Toggle Sidebar">◀</button>
+                    </div>
+                    <ul class="sidebar-list" id="sidebar-list">
+                        <div id="cp-placeholder" style="color: #555; font-size: 0.8em; padding: 10px; text-align: center;">No checkpoints yet...</div>
+                    </ul>
+                </div>
+
+                <div class="main-content" id="main-scroll-area">
+                    <div id="log-container">
+                        <div style="color: #858585; font-size: 0.8em; margin-bottom: 10px;">Waiting for logs...</div>
+                    </div>
+                </div>
             </div>
 
             <script>
+                let rawLogData = []; // Store raw text for copying
                 let knownLogCount = 0;
                 let isAutoScrollEnabled = true;
                 let allExpanded = false;
@@ -488,9 +563,14 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                 
                 const TOKEN_LIMIT = 10000;
 
-                window.addEventListener('scroll', () => {{
-                    const scrollPosition = window.innerHeight + window.scrollY;
-                    const pageHeight = document.documentElement.scrollHeight;
+                // Set default filters based on checkboxes
+                document.body.classList.add('hide-raw', 'hide-traces');
+
+                const mainScrollArea = document.getElementById('main-scroll-area');
+
+                mainScrollArea.addEventListener('scroll', () => {{
+                    const scrollPosition = mainScrollArea.clientHeight + mainScrollArea.scrollTop;
+                    const pageHeight = mainScrollArea.scrollHeight;
                     isAutoScrollEnabled = (pageHeight - scrollPosition < 30);
                 }});
 
@@ -515,6 +595,80 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                     }});
                 }}
 
+                // Toggle the sidebar width
+                function toggleSidebar() {{
+                    const sidebar = document.getElementById('checkpoint-sidebar');
+                    const btn = document.getElementById('toggle-sidebar-btn');
+                    
+                    sidebar.classList.toggle('collapsed');
+                    
+                    // Change arrow direction based on state
+                    if (sidebar.classList.contains('collapsed')) {{
+                        btn.innerText = '▶';
+                    }} else {{
+                        btn.innerText = '◀';
+                    }}
+                }}
+
+                // Copy entire un-truncated text to clipboard
+                async function copyText(btn, index) {{
+                    try {{
+                        const rawText = rawLogData[index].content;
+                        await navigator.clipboard.writeText(rawText);
+                        
+                        // Visual feedback
+                        const originalText = btn.innerText;
+                        btn.innerText = "✓ Copied";
+                        btn.style.color = "#4ade80";
+                        btn.style.borderColor = "#4ade80";
+                        
+                        setTimeout(() => {{
+                            btn.innerText = originalText;
+                            btn.style.color = "";
+                            btn.style.borderColor = "";
+                        }}, 2000);
+                    }} catch (err) {{
+                        console.error('Failed to copy text: ', err);
+                        btn.innerText = "Failed";
+                    }}
+                }}
+
+                // Navigate to a specific card from the sidebar
+                function jumpToCard(index) {{
+                    const card = document.getElementById(`card-${{index}}`);
+                    if (card) {{
+                        // Temporarily remove any hidden classes to ensure it's visible
+                        const roleClass = 'role-' + rawLogData[index].role;
+                        const bodyHadClass = document.body.classList.contains('hide-' + rawLogData[index].role.split('_')[0]); // rough check
+                        
+                        card.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+                        
+                        // Reset animation
+                        card.classList.remove('flash-highlight');
+                        void card.offsetWidth; // Trigger reflow
+                        card.classList.add('flash-highlight');
+                    }}
+                }}
+
+                function appendCheckpoint(index, type, label, summary, timestamp) {{
+                    const sidebar = document.getElementById('sidebar-list');
+                    
+                    // Safely remove only the placeholder
+                    const placeholder = document.getElementById('cp-placeholder');
+                    if (placeholder) placeholder.remove(); 
+                    
+                    const li = document.createElement('li');
+                    li.className = `checkpoint-item cp-${{type}}`;
+                    li.onclick = () => jumpToCard(index);
+                    
+                    li.innerHTML = `
+                        <div style="font-weight: 600;">${{label}}</div>
+                        <div style="color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${{summary}}</div>
+                        <div class="checkpoint-time">${{timestamp}}</div>
+                    `;
+                    sidebar.appendChild(li);
+                }}
+
                 async function fetchLogs() {{
                     if (isFetching) return;
                     isFetching = true;
@@ -531,11 +685,24 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                             
                             for (let i = knownLogCount; i < history.length; i++) {{
                                 const log = history[i];
+                                rawLogData.push(log); // Save for copying
+                                
                                 const isError = log.is_error ? 'error' : '';
                                 const isHuman = log.role === 'human' ? 'human' : '';
+                                const roleClass = `role-${{log.role}}`;
                                 
                                 const toolText = log.tool_name ? ` | Tool: ${{log.tool_name}}` : '';
                                 const nodeText = log.node_name ? `Node: ${{log.node_name}}` : `Role: ${{log.role}}`;
+                                
+                                // --- Sidebar Checkpoint Logic ---
+                                if (log.role === 'human') {{
+                                    appendCheckpoint(i, 'human', 'Human Intervention', escapeHTML(log.content).substring(0, 40) + '...', log.timestamp);
+                                }} else if (log.is_error) {{
+                                    appendCheckpoint(i, 'error', `Error: ${{log.node_name}}`, toolText.replace(' | Tool: ', ''), log.timestamp);
+                                }} else if (log.node_name === 'Manager' && log.role === 'ai_tool_call' && log.tool_name === 'RouteDecision') {{
+                                    appendCheckpoint(i, 'manager', 'Manager Routing', escapeHTML(log.content).substring(0, 40) + '...', log.timestamp);
+                                }}
+                                // --------------------------------
                                 
                                 let tokenHtml = '';
                                 if (log.role === 'ai_prompt') {{
@@ -554,7 +721,7 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                                 }}
                                 
                                 const card = document.createElement('div');
-                                card.className = `log-card ${{isError}} ${{isHuman}}`;
+                                card.className = `log-card ${{isError}} ${{isHuman}} ${{roleClass}}`;
                                 card.id = `card-${{i}}`;
                                 
                                 card.innerHTML = `
@@ -565,6 +732,7 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                                         </div>
                                         <div class="log-meta-right">
                                             ${{tokenHtml}}
+                                            <button class="copy-btn" onclick="copyText(this, ${{i}})">Copy</button>
                                             <button class="toggle-btn" id="btn-${{i}}" onclick="toggleSingleCard(this, ${{i}})">▼ Expand</button>
                                         </div>
                                     </div>
@@ -588,7 +756,10 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                             knownLogCount = history.length;
 
                             if (isAutoScrollEnabled) {{
-                                window.scrollTo(0, document.documentElement.scrollHeight);
+                                mainScrollArea.scrollTo(0, mainScrollArea.scrollHeight);
+                                // Auto scroll sidebar too
+                                const sidebarList = document.getElementById('sidebar-list');
+                                sidebarList.scrollTo(0, sidebarList.scrollHeight);
                             }}
                             
                             const indicator = document.getElementById('status-indicator');

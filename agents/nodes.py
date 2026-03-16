@@ -481,6 +481,7 @@ def manager_node(state: AgencyState) -> dict:
         "6. FINALIZING CODE: If the Developer's status is 'COMPLETE', route to 'DevOps' to push the final code and create a production Pull Request.\n"
         "7. SLEEP (PROJECT DONE): If DevOps has created the final Pull Request, use `update_linear_ticket` to notify the human of success, then route to 'FINISH'.\n"
         "8. STANDARD BUILD: If none of the above apply, and the core feature still needs to be built or is 'IN_PROGRESS', route to the 'Developer'.\n"
+        "9. IMPORTANT: `RouteDecision` is a handoff tool which must be called in a separate, final turn. DO NOT call `RouteDecision` in the same turn as any other tool.\n\n"
     ))
 
     # ---------------------------------------------------------
@@ -660,10 +661,11 @@ def developer_node(state: AgencyState) -> dict:
         "   - Example: You built the HTML/CSS successfully and want to log your progress before starting the complex API logic.\n\n"
     
         "4.3. STATE: 'BLOCKED' (Human-in-the-Loop & Secrets Protocol)\n"
-        "   - You are operating in a restricted sandbox to build a Production App. Use this immediately if your solution requires external API keys, database credentials, or bypasses network blocks. DO NOT fake the implementation with mock data.\n"
+        "   - You are operating in a restricted sandbox to build a Production App. DO NOT fake the implementation with mock data.\n"
         "   - Step A (Coding): NEVER hardcode API keys or secrets into the codebase. Write your code to read secrets securely from environment variables (e.g., `process.env.NEWS_API_KEY`). YOU MUST also add the variable name (without the real value) to a `.env.example` file in the root of the project.\n"
         "   - Step B (Frontend Security): If the frontend requires a secret API key, you MUST NOT put the key in the frontend JS. You must proxy the API call through your backend server/functions to protect the secret.\n"
-        "   - Step C (Blocking): Call `ReportStatus(status='BLOCKED')`. In the `thought` parameter, NEVER ask the client to paste a secret into the ticketing system. Instead, instruct the client exactly like this: 'I am blocked. Please complete these two steps: 1) Securely add the [NAME_OF_VARIABLE] API key to your Project Settings Vault in the AI Agency dashboard so I can test it. 2) Add the exact same key to your GitHub Repository Secrets so the Firebase auto-deploy will work. Reply \"Done\" to this ticket when finished.'\n\n"
+        "   - Step C (Verification Before Blocking): Client secrets from the vault are ALWAYS automatically injected into your `run_terminal_command` and `manage_dev_server` environments. Before assuming you are blocked, you MUST run a test (e.g., run your unit tests or start the server) to check if the environment variable is already present. If your code successfully reads the secret, DO NOT block; continue working.\n"
+        "   - Step D (Blocking): ONLY if your test confirms the secret is truly missing (e.g., throws an undefined error), call `ReportStatus(status='BLOCKED')`. In the `thought` parameter, instruct the client exactly like this: 'I am blocked. Please complete these two steps: 1) Securely add the [NAME_OF_VARIABLE] API key to your Project Settings Vault in the AI Agency dashboard so I can test it. 2) Add the exact same key to your GitHub Repository Secrets so the Firebase auto-deploy will work. Reply \"Done\" to this ticket when finished.'\n\n"
         
         "5. DO NOT attempt to use `git commit` or `git push` yourself via the terminal under any circumstances. If you need to save your progress, you MUST use the dedicated `sync_wip_commit` tool. You must call `sync_wip_commit` regularly after every major `write_file` operation or significant codebase change to ensure your progress is continuously backed up.\n"
         "6. IMPORTANT: `ReportStatus` is a handoff tool which must be called in a separate, final turn. DO NOT call `ReportStatus` in the same turn as any other tool.\n\n"
@@ -698,9 +700,9 @@ def developer_node(state: AgencyState) -> dict:
         "   - Hypothesis: State what you think is wrong.\n"
         "   - Action: Use `write_file` to fix it.\n"
         "   - Observation: You MUST test the code to observe if it worked before declaring the task COMPLETE.\n"
-        "3. SERVER MANAGEMENT & WAITING (Urgent): Never use `run_terminal_command` to start a web server (it will cause a timeout). You MUST use the `manage_dev_server` tool to start/stop servers in the background (e.g., `manage_dev_server(action='start', command='npx firebase emulators:start')`). IMPORTANT: When you call `action='start'`, you MUST NOT call `action='logs'` or test the port in the exact same turn. Perform exploration or edits for at least 2 turns before checking logs, as the emulator takes time to boot.\n"
-        "4. OBSERVATION TOOLS & ENVIRONMENT LIMITATIONS: To complete your HAO loop, you normally observe results via `manage_dev_server(action='logs')` or `inspect_frontend(url='http://localhost:5000')`. HOWEVER, be aware that this E2B sandbox is currently missing critical system libraries (`libnspr4.so`). This often causes tools like Playwright and Firebase Java emulators to crash silently, resulting in 'connection refused' errors and empty logs.\n"
-        "5. UNIT TESTING PIVOT (EMULATOR WORKAROUND): If local ports fail to bind, `manage_dev_server` continues to return empty logs, OR `curl` results in 'connection refused' after you have waited the required boot time:\n"
+        "3. SERVER MANAGEMENT & WAITING: Never use `run_terminal_command` to start a web server (it will cause a timeout). You MUST use the `manage_dev_server` tool to start/stop servers in the background (e.g., `manage_dev_server(action='start', command='npx firebase emulators:start')`). IMPORTANT: The tool will automatically pause and wait for the server to boot before returning the initial logs to you. You do not need to wait multiple turns. If the boot was successful, you can immediately test the port or call `inspect_frontend` in your very next turn.\n"
+        "4. OBSERVATION TOOLS: To complete your HAO loop, you must observe results via `manage_dev_server(action='logs')` or `inspect_frontend(url='http://localhost:5000')`. Always attempt to verify your code on the live server first.\n"
+        "5. UNIT TESTING PIVOT (FALLBACK): If local ports fail to bind, `manage_dev_server` continues to return empty logs or errors, OR `curl` results in 'connection refused':\n"
         "   - ABANDON live server testing immediately. Do not attempt `inspect_frontend` again.\n"
         "   - Use `write_file` to create isolated unit test files (e.g., `jest`, `pytest`, or a simple `test_logic.js` script that directly imports your backend functions/logic).\n"
         "   - Run these unit tests directly via `run_terminal_command(command='node test_logic.js')` to verify your logic without booting a network server.\n"
@@ -833,6 +835,11 @@ def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
                 has_verified = True  # Successfully tested frontend
             elif tool_name == "manage_dev_server" and tool["args"].get("action") == "logs":
                 has_verified = True  # Successfully checked backend logs
+            elif tool_name == "run_terminal_command":
+                cmd = tool["args"].get("command", "").lower()
+                # If the agent runs a test file, allow it to satisfy the Verification Gate
+                if "test.js" in cmd or "npm test" in cmd or "pytest" in cmd or "jest" in cmd:
+                    has_verified = True  
             # -----------------------------------
 
             # Dynamically execute actual tools
@@ -892,7 +899,8 @@ def devops_node(state: AgencyState) -> dict:
         "2. IF DEVELOPER IS 'COMPLETE': Use the `create_github_pr` tool to commit the finished code, push it to origin, and open a standard Pull Request ready for production review.\n"
         "3. IF DEVELOPER IS 'BLOCKED': Use the SAME `create_github_pr` tool to rescue the incomplete code from the ephemeral sandbox. The tool will automatically name the branch. Title the Pull Request 'WIP: Blocked awaiting human' so the human can easily review and fix the broken code.\n"
         "4. Completion: When finished, call `DevOpsReport(status='COMPLETE', thought='[State whether you created a final PR or a WIP Blocked PR, include the GitHub URL, and specify the EXACT branch name used]', pr_url='<INSERT URL HERE>')` to hand control back to the Manager.\n"
-        "5. IMPORTANT: DO NOT use terminal commands or write code. Do NOT update the Linear ticket.\n"
+        "5. DO NOT use terminal commands or write code. Do NOT update the Linear ticket.\n"
+        "6. IMPORTANT: `DevOpsReport` is a handoff tool which must be called in a separate, final turn. DO NOT call `DevOpsReport` in the same turn as any other tool.\n\n"
     ))
 
     isolated_history = filter_agent_history(state["messages"], agent_role="DevOps")

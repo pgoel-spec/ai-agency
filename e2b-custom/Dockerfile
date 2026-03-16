@@ -1,5 +1,5 @@
 # 1. Base Image: Microsoft's Playwright image (Includes Node.js, npm, and all Linux browser GUI dependencies)
-FROM mcr.microsoft.com/playwright:v1.42.0-jammy
+FROM mcr.microsoft.com/playwright:v1.58.2-jammy
 
 # 2. System Dependencies: Install Java (Required for Firebase Emulators), Python, and Git
 RUN apt-get update && apt-get install -y \
@@ -9,6 +9,10 @@ RUN apt-get update && apt-get install -y \
     python3-venv \
     git \
     curl \
+    libnspr4 \
+    libnss3 \
+    libxss1 \
+    libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Global Backend Tools: Install Firebase CLI globally so the agent doesn't struggle with 'npx' paths
