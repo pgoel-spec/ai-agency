@@ -287,7 +287,7 @@ def update_linear_ticket(message: str, config: RunnableConfig) -> str:
 
     url = "https://api.linear.app/graphql"
     headers = {
-        "Authorization": api_key,
+        "Authorization": linear_api_key,
         "Content-Type": "application/json",
     }
     

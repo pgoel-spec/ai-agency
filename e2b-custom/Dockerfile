@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     python3-venv \
     git \
     curl \
+    psmisc \
     libnspr4 \
     libnss3 \
     libxss1 \
