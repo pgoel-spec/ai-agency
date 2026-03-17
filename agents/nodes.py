@@ -10,7 +10,8 @@ from langchain_core.runnables import RunnableConfig
 from .state import AgencyState, DEVELOPER_ITERATION_LIMIT
 from .tools import (
     update_linear_ticket, create_github_pr, run_terminal_command, 
-    read_file, write_file, sync_wip_commit, manage_dev_server, inspect_frontend
+    read_file, write_file, sync_wip_commit, manage_dev_server, inspect_frontend,
+    web_search, generate_repo_map
 )
 from database import get_logs_by_ticket, log_activity
 from tenacity import (
@@ -77,7 +78,7 @@ class DevOpsReport(BaseModel):
     pr_url: str = Field(description="The URL of the created PR, if applicable.", default="")
 
 manager_tools = [RouteDecision, update_linear_ticket]
-developer_tools = [ReportStatus, run_terminal_command, read_file, write_file, sync_wip_commit, manage_dev_server, inspect_frontend]
+developer_tools = [ReportStatus, run_terminal_command, read_file, write_file, sync_wip_commit, manage_dev_server, inspect_frontend, web_search, generate_repo_map]
 devops_tools = [DevOpsReport, create_github_pr]
 
 # Initialize the Models via Vertex AI with JSON enforcement
@@ -466,6 +467,10 @@ def manager_node(state: AgencyState) -> dict:
         f"{detailed_debug_context}\n"
         f"--------------------------------------------------\n\n"
         
+        "--- ENVIRONMENTAL CONSTRAINTS ---\n"
+        "The Developer operates in a headless, non-interactive Linux sandbox. They CANNOT execute commands that require a web browser or terminal user input (e.g., `[Y/n]` prompts, `firebase login`, `aws configure`, `npm login`).\n"
+        "Do NOT instruct the Developer to authenticate with cloud providers. All necessary API keys and client secrets are automatically injected into the Developer's OS environment variables via the system vault. If you see CLI warnings about being 'unauthenticated' or 'offline', ignore them unless they are fatal crash errors.\n\n"
+        
         "YOUR CORE RESPONSIBILITIES:\n"
         "1. Read the Team Work Log from top to bottom. This is a chronological log and the last step is the current state of the project.\n"
         "2. Read the Original Client Request and compare it against the Team Work Log.\n"
@@ -646,14 +651,16 @@ def developer_node(state: AgencyState) -> dict:
         #"1. Work through the process intelligently. You are encouraged to BATCH multiple tool calls in a single turn whenever possible to save time. For example, you can call `write_file` and immediately call `sync_wip_commit` in the exact same response.\n"
         "2. Initialization & Discovery:\n"
         "   - Clone & Entry: If the repo is not cloned, run git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git. Run ls to observe the folder name and cd into it before modifying files.\n"
+        "   - Codebase Ingestion (CRITICAL): Once the code is cloned, you MUST immediately call the `generate_repo_map` tool to ingest the entire repository layout and file contents into your memory.\n"
         "   - Secrets Discovery (Presence): Run env | grep _API_ or printenv immediately to identify secrets injected by the system vault. If a required key (e.g., NEWS_API_KEY) is present, it is live; never report 'BLOCKED' due to a missing key if it appears in this output.\n"
         "   - Functional Verification (Validity): Presence does not equal functionality. You MUST verify key validity during the 'Verification' phase. If a key is present in env but triggers a 401 or Unauthorized error during a live test or server boot, report 'BLOCKED' and specify that the key is invalid.\n"
         "   - Dependencies: Check for manifest files (package.json, requirements.txt, pom.xml). You MUST run the appropriate install command (npm install, pip install -r requirements.txt) in that directory before starting servers or running tests.\n"
-        "3. Codebase Exploration: Do NOT guess file paths. If you just cloned the code, all files are located inside the folder you observed in the previous step. When using `read_file` or `write_file`, you must include that folder name at the start of your path. Your first priority is to build a 'System Map':\n"
-        "   - Run `ls -R` to understand the full directory hierarchy. If you receive a No such file or directory error, immediately run pwd and ls -R to re-orient yourself.\n"
-        "   - Identify and read the 'Source of Truth' files: Look for dependency manifests (e.g., package.json, requirements.txt, pyproject.toml) and core schemas or state definitions.\n"
-        "   - Locate the main Entry Points (e.g., main.py, index.js, app.py, or Dockerfiles) to understand the execution flow.\n"
-        "   - Use this information to create a mental map of the architecture before modifying any code. This ensures you respect existing design patterns and folder structures.\n"
+        "3. Codebase Exploration: Do NOT guess file paths. Use the output from `generate_repo_map` to build your 'System Map'. Do NOT use `ls -R` or `read_file` to explore the project initially, as `generate_repo_map` provides the complete architecture. Use this holistic map to locate your 'Source of Truth' files and Entry Points before modifying any code.\n"
+        #"3. Codebase Exploration: Do NOT guess file paths. If you just cloned the code, all files are located inside the folder you observed in the previous step. When using `read_file` or `write_file`, you must include that folder name at the start of your path. Your first priority is to build a 'System Map':\n"
+        #"   - Run `ls -R` to understand the full directory hierarchy. If you receive a No such file or directory error, immediately run pwd and ls -R to re-orient yourself.\n"
+        #"   - Identify and read the 'Source of Truth' files: Look for dependency manifests (e.g., package.json, requirements.txt, pyproject.toml) and core schemas or state definitions.\n"
+        #"   - Locate the main Entry Points (e.g., main.py, index.js, app.py, or Dockerfiles) to understand the execution flow.\n"
+        #"   - Use this information to create a mental map of the architecture before modifying any code. This ensures you respect existing design patterns and folder structures.\n"
         
         "4. Progress Evaluation & Completion: You must intelligently evaluate your progress against the original request. You MUST call the `ReportStatus` tool to yield control back to the Manager, selecting ONE of the following three states:\n"
         "4.1. STATE: 'COMPLETE'\n"
@@ -669,8 +676,9 @@ def developer_node(state: AgencyState) -> dict:
         "   - Step A (Coding): NEVER hardcode API keys or secrets into the codebase. Write your code to read secrets securely from environment variables (e.g., `process.env.NEWS_API_KEY`). YOU MUST also add the variable name (without the real value) to a `.env.example` file in the root of the project.\n"
         "   - Step B (Frontend Security): If the frontend requires a secret API key, you MUST NOT put the key in the frontend JS. You must proxy the API call through your backend server/functions to protect the secret.\n"
         "   - Step C (Verification Before Blocking): Client secrets from the vault are ALWAYS automatically injected into your `run_terminal_command` and `manage_dev_server` environments. Before assuming you are blocked, you MUST run a test (e.g., run your unit tests or start the server) to check if the environment variable is already present. If your code successfully reads the secret, DO NOT block; continue working.\n"
-        "   - Step D (Blocking): ONLY if your test confirms the secret is truly missing (e.g., throws an undefined error), call `ReportStatus(status='BLOCKED')`. In the `thought` parameter, instruct the client exactly like this: 'I am blocked. Please complete these two steps: 1) Securely add the [NAME_OF_VARIABLE] API key to your Project Settings Vault in the AI Agency dashboard so I can test it. 2) Add the exact same key to your GitHub Repository Secrets so the Firebase auto-deploy will work. Reply \"Done\" to this ticket when finished.'\n\n"
-        
+        "   - Step D (Blocking): ONLY if your test confirms the secret is truly missing (e.g., throws an undefined error), call `ReportStatus(status='BLOCKED')`. In the `thought` parameter, instruct the client exactly like this: 'I am blocked. Please complete these two steps: 1) Securely add the [NAME_OF_VARIABLE] API key to your Project Settings Vault in the AI Agency dashboard so I can test it. 2) Add the exact same key to your GitHub Repository Secrets so the Firebase auto-deploy will work. Reply \"Done\" to this ticket when finished.'\n"
+        "   - Step E (API Limitations & Quotas): If an external API returns a hard restriction error (e.g., 'quota exceeded', 'rate limited', or 'upgrade to a paid plan') AND you cannot bypass the error by adjusting your code's parameters, you MUST stop testing. Call `ReportStatus(status='BLOCKED')`. In the `thought` parameter, instruct the client: 'I am blocked due to an API limitation: [Insert exact API error]. Please upgrade your API plan or reply with permission to alter the project constraints. Reply \"Done\" when resolved.'\n\n"
+
         "5. DO NOT attempt to use `git commit` or `git push` yourself via the terminal under any circumstances. If you need to save your progress, you MUST use the dedicated `sync_wip_commit` tool. You must call `sync_wip_commit` regularly after every major `write_file` operation or significant codebase change to ensure your progress is continuously backed up.\n"
         "6. IMPORTANT: `ReportStatus` is a handoff tool which must be called in a separate, final turn. DO NOT call `ReportStatus` in the same turn as any other tool.\n\n"
         
@@ -679,6 +687,11 @@ def developer_node(state: AgencyState) -> dict:
         "- Do not use basic vanilla CSS unless absolutely necessary. By default, import Tailwind CSS via CDN (`<script src=\"https://cdn.tailwindcss.com\"></script>`) for rapid, modern styling.\n"
         "- Ensure all interfaces are fully responsive (mobile-first), use modern typography (e.g., Inter or Roboto via Google Fonts), incorporate soft shadows, rounded corners (`rounded-lg`), and proper whitespace (`gap`, `p-`, `m-`).\n"
         "- Add subtle hover states and CSS transitions to make the UI feel interactive.\n\n"
+
+        "ROBUST API ERROR HANDLING (THE SILENT 200 TRAP):\n"
+        "- When writing backend Express.js code that fetches data from external APIs, do NOT rely solely on `response.ok`. Many third-party APIs return error payloads disguised as 200 OK responses (e.g., `{ \"status\": \"error\", \"message\": \"Quota exceeded\" }`).\n"
+        "- You MUST always parse the JSON response from the external API and check for logical error fields (such as `error`, `status: 'error'`, `success: false`, or `fault`).\n"
+        "- If the external API payload contains a logical error, your Express route MUST forcefully throw an error or return `res.status(400)` / `res.status(500)`. This guarantees that your frontend `fetch` catches the failure and logs a console error, allowing `inspect_frontend` to observe the bug.\n\n"
 
         "CI/CD & SECRETS MANAGEMENT:\n"
         "1. `.env.example`: Whenever you introduce a new environment variable (e.g., `process.env.STRIPE_KEY`), you MUST document it by adding the variable name to a `.env.example` file at the root of the project.\n"
@@ -700,13 +713,17 @@ def developer_node(state: AgencyState) -> dict:
 
        "RULES FOR TESTING & DEBUGGING (ENVIRONMENT CRITICAL):\n"
         "1. RESTRICTED ENVIRONMENT: You do not have root/sudo access. NEVER use 'sudo' or the '-g' (global) flag with npm or pip. To execute CLI tools, you MUST use 'npx' (e.g., 'npx firebase emulators:start') to ensure the local version is used.\n"
-        "2. THE HAO LOOP: When fixing a bug, you MUST follow the Hypothesis -> Action -> Observation loop.\n"
+        "2. HEADLESS ENVIRONMENT LIMITATIONS: You are operating in a non-interactive, headless Linux sandbox. You CANNOT execute interactive commands that require user input (e.g., `[Y/n]` prompts) or web browser authentication (e.g., `firebase login`, `aws configure`, `gh auth login`).\n"
+        "3. SECRETS OVER CLOUD AUTH: If a CLI tool throws a warning about being unauthenticated, IGNORE IT. Do not attempt to log in. Your API keys and secrets are injected directly into your OS environment variables (`process.env`) via the system vault; you do not need to authenticate the CLI with cloud providers to test your code locally.\n"
+        "4. THE H-R-A-O LOOP: When fixing a bug or using an unfamiliar framework, you MUST follow this loop:\n"
         "   - Hypothesis: State what you think is wrong.\n"
-        "   - Action: Use `write_file` to fix it.\n"
-        "   - Observation: You MUST test the code to observe if it worked before declaring the task COMPLETE.\n"
-        "3. SERVER MANAGEMENT & WAITING: Never use `run_terminal_command` to start a web server (it will cause a timeout). You MUST use the `manage_dev_server` tool to start/stop servers in the background (e.g., `manage_dev_server(action='start', command='npx firebase emulators:start')`). IMPORTANT: The tool will automatically pause and wait for the server to boot before returning the initial logs to you. You do not need to wait multiple turns. If the boot was successful, you can immediately test the port or call `inspect_frontend` in your very next turn.\n"
-        "4. OBSERVATION TOOLS: To complete your HAO loop, you must observe results via `manage_dev_server(action='logs')` or `inspect_frontend(url='http://localhost:5000')`. Always attempt to verify your code on the live server first.\n"
-        "5. UNIT TESTING PIVOT (FALLBACK): If local ports fail to bind, `manage_dev_server` continues to return empty logs or errors, OR `curl` results in 'connection refused':\n"
+        "   - Research (CRITICAL): If you encounter a persistent error (like a 404, compilation failure, or missing dependency) DO NOT GUESS. You MUST use the `web_search` tool to search for the specific error message or framework documentation (e.g., 'Firebase Express rewrite 404').\n"
+        "   - Action: Use `write_file` or `run_terminal_command` to implement the researched solution.\n"
+        "   - Observation: You MUST test the code via `manage_dev_server` or `inspect_frontend` to observe if it worked before declaring the task COMPLETE.\n"
+        "5. AVOID HALLUCINATION: Frameworks update constantly. If you are unsure how a specific configuration file (like firebase.json, next.config.js, or Dockerfiles) handles routing or ports, use the `web_search` tool before writing code.\n"
+        "6. SERVER MANAGEMENT & WAITING: Never use `run_terminal_command` to start a web server (it will cause a timeout). You MUST use the `manage_dev_server` tool to start/stop servers in the background (e.g., `manage_dev_server(action='start', command='npx firebase emulators:start')`). IMPORTANT: The tool will automatically pause and wait for the server to boot before returning the initial logs to you. You do not need to wait multiple turns. If the boot was successful, you can immediately test the port or call `inspect_frontend` in your very next turn.\n"
+        "7. OBSERVATION TOOLS: To complete your HAO loop, you must observe results via `manage_dev_server(action='logs')` or `inspect_frontend(url='http://localhost:5000')`. Always attempt to verify your code on the live server first.\n"
+        "8. UNIT TESTING PIVOT (FALLBACK): If local ports fail to bind, `manage_dev_server` continues to return empty logs or errors, OR `curl` results in 'connection refused':\n"
         "   - ABANDON live server testing immediately. Do not attempt `inspect_frontend` again.\n"
         "   - Use `write_file` to create isolated unit test files (e.g., `jest`, `pytest`, or a simple `test_logic.js` script that directly imports your backend functions/logic).\n"
         "   - Run these unit tests directly via `run_terminal_command(command='node test_logic.js')` to verify your logic without booting a network server.\n"
@@ -787,7 +804,9 @@ def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
         "write_file": write_file,
         "sync_wip_commit": sync_wip_commit,
         "manage_dev_server": manage_dev_server,
-        "inspect_frontend": inspect_frontend
+        "inspect_frontend": inspect_frontend,
+        "web_search": web_search,
+        "generate_repo_map": generate_repo_map
     }
 
     # Fetch existing status

@@ -3,7 +3,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
 # --- GLOBAL CONFIGURATION ---
-DEVELOPER_ITERATION_LIMIT = 15
+DEVELOPER_ITERATION_LIMIT = 25
 
 class AgencyState(TypedDict):
     # The core conversation and code history

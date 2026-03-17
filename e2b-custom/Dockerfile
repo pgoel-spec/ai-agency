@@ -28,5 +28,15 @@ RUN npm install -g jest supertest jest-environment-jsdom ts-node typescript
 # instantly instead of downloading hundreds of megabytes from the internet.
 RUN npm install -g firebase-admin firebase-functions express cors
 
-# Set the default working directory
+# Set a shared global path for Playwright browsers
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Install Playwright globally and download Chromium
+RUN npm install -g playwright
+RUN npx playwright install chromium --with-deps
+
+# Grant read/execute permissions to the shared browser folder so the E2B user can access it
+RUN chmod -R 777 /ms-playwright
+
+# Set the default working directory for the runtime
 WORKDIR /home/user

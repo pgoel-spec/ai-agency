@@ -7,6 +7,7 @@ from e2b_code_interpreter import Sandbox
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
+from langchain_tavily import TavilySearch
 import shlex
 
 # Create schemas to hide the 'workspace' parameter from the LLM
@@ -32,6 +33,14 @@ class ManageDevServerInput(BaseModel):
 
 class InspectFrontendInput(BaseModel):
     url: str = Field(description="The local URL to inspect, e.g. http://localhost:5000")
+
+# Add this schema near your other Input schemas at the top of the file
+class WebSearchInput(BaseModel):
+    query: str = Field(description="The search query to look up on the internet (e.g., 'Firebase Express rewrite 404').")
+
+class GenerateRepoMapInput(BaseModel):
+    """No arguments required."""
+    pass
 
 def _parse_github_time(ts_str: str) -> datetime:
     """Safely converts a GitHub ISO 8601 string to a datetime object."""
@@ -185,6 +194,26 @@ def run_terminal_command(command: str, config: RunnableConfig) -> str:
     if not workspace:
         return "Error: No active sandbox found in configuration."
 
+    # --- THE SERVER GUARDRAIL ---
+    forbidden_server_commands = [
+        "firebase emulators:start", 
+        "npm run dev", 
+        "npm start", 
+        "node server.js",
+        "python -m http.server",
+        "flask run",
+        "uvicorn",
+        "ng serve"
+    ]
+    
+    # If the AI tries to run a blocking server command, reject it instantly.
+    if any(bad_cmd in command.lower() for bad_cmd in forbidden_server_commands):
+        return (
+            "CRITICAL SYSTEM ERROR: You attempted to start a persistent web server using `run_terminal_command`. "
+            "This is strictly forbidden because it will cause a timeout and break the sandbox ports. "
+            "You MUST use the `manage_dev_server` tool with `action='start'` to run this command instead."
+        )
+
     # --- ENFORCE GITIGNORE BEFORE INSTALLS ---
     # Detect if the agent is trying to install massive dependency folders
     install_keywords = [
@@ -193,11 +222,15 @@ def run_terminal_command(command: str, config: RunnableConfig) -> str:
     ]
     
     if any(keyword in command.lower() for keyword in install_keywords):
-        # Dynamically prepend a bash script to safely append standard ignores 
+        # Dynamically locate the true git root directory, then safely append standard ignores 
         # and remove duplicates (using sort -u) without interrupting the actual command.
         gitignore_safeguard = (
-            "echo -e 'node_modules/\\nvenv/\\n.venv/\\n__pycache__/\\n*.pyc\\n.env\\n.next/\\nbuild/\\ndist/' >> .gitignore;"
-            "sort -u .gitignore -o .gitignore;"
+            "GIT_DIR=$(find /home/user -maxdepth 3 -type d -name '.git' | head -n 1); "
+            "if [ -n \"$GIT_DIR\" ]; then "
+            "  REPO_ROOT=$(dirname \"$GIT_DIR\"); "
+            "  echo -e 'node_modules/\\nvenv/\\n.venv/\\n__pycache__/\\n*.pyc\\n.env\\n.next/\\nbuild/\\ndist/' >> \"$REPO_ROOT/.gitignore\"; "
+            "  sort -u \"$REPO_ROOT/.gitignore\" -o \"$REPO_ROOT/.gitignore\"; "
+            "fi;"
         )
         command = f"{command}\n{gitignore_safeguard}"
     
@@ -302,12 +335,12 @@ def update_linear_ticket(message: str, config: RunnableConfig) -> str:
     
     response = requests.post(
         url, 
-        json={"query": query, "variables": {"issueId": issue_id, "body": message}}, 
+        json={"query": query, "variables": {"issueId": ticket_id, "body": message}}, 
         headers=headers
     )
     
     if response.status_code == 200 and "errors" not in response.json():
-        return f"Successfully posted update to ticket {issue_id}"
+        return f"Successfully posted update to ticket {ticket_id}"
     return f"Failed to update ticket: {response.text}"
 
 @tool(args_schema=GitHubPRInput)
@@ -581,19 +614,40 @@ def manage_dev_server(action: str, command: str, config: RunnableConfig) -> str:
         cleanup_cmd = f"""
         echo "Stopping parent process recorded in {pid_file}..."
         PID=$(cat {pid_file} || echo "")
-        if [ ! -z "$PID" ]; then kill -9 $PID || echo "PID dead"; fi
+        if [ ! -z "$PID" ]; then kill -15 $PID || kill -9 $PID || echo "PID dead"; fi
         
-        echo "Aggressively cleaning Firebase ports and Zombie Java processes..."
-        fuser -k 8080/tcp 5000/tcp 5001/tcp 4000/tcp 4400/tcp || true
+        echo "Dynamically finding and freeing Firebase ports..."
         
-        # Kill any lingering Java (Firebase Emulator) or Node processes
-        pkill -9 -f java || true
-        pkill -9 -f firebase || true
+        # 1. Define standard default Firebase ports
+        PORTS="4000 4400 4500 5000 5001 8080 8081 8085 9000 9099 9199"
+        
+        # 2. Intelligently extract ANY custom ports the AI configured in firebase.json
+        FIREBASE_JSON=$(find /home/user -maxdepth 3 -name firebase.json -print -quit)
+        if [ ! -z "$FIREBASE_JSON" ]; then
+            # Uses grep to find all port numbers defined in the JSON
+            CUSTOM_PORTS=$(grep -o '"port": *[0-9]*' "$FIREBASE_JSON" | grep -o '[0-9]*')
+            PORTS="$PORTS $CUSTOM_PORTS"
+        fi
+        
+        # 3. Use fuser to find processes on these ports and kill them gracefully
+        for PORT in $PORTS; do
+            # -15 sends SIGTERM (graceful shutdown)
+            fuser -k -15 ${{PORT}}/tcp 2>/dev/null || true
+        done
+        
+        sleep 1 # Give the emulators a second to cleanly close their local databases
+        
+        # 4. Force kill anything that refused to shut down
+        for PORT in $PORTS; do
+            # -9 sends SIGKILL (force shutdown)
+            fuser -k -9 ${{PORT}}/tcp 2>/dev/null || true
+        done
         
         rm -f {pid_file} {log_file}
+        echo "Server and all related ports successfully freed."
         """
         workspace.commands.run(f"bash -c {shlex.quote(cleanup_cmd)}")
-        return "Server and all related ports forcefully stopped and cleaned."
+        return "Server and all related ports dynamically found and stopped."
     
     return "Invalid action."
 
@@ -628,10 +682,106 @@ def inspect_frontend(url: str, config: RunnableConfig) -> str:
         }}
     }})();
     """
-    workspace.files.write("/tmp/inspect.js", script)
+    workspace.files.write("/home/user/inspect.js", script)
     
-    # Quietly install playwright if it's missing, then run the script
-    workspace.commands.run("cd /tmp && npm install playwright")
-    res = workspace.commands.run("node /tmp/inspect.js")
+    # Explicitly tell Playwright exactly where we stored the browsers in the Docker image
+    cmd = "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright NODE_PATH=$(npm root -g) node /home/user/inspect.js"
+    res = workspace.commands.run(cmd)
     
     return res.stdout or res.stderr
+
+@tool(args_schema=WebSearchInput)
+def web_search(query: str, config: RunnableConfig) -> str:
+    """Searches the internet for framework documentation, tutorials, or solutions to persistent errors."""
+    
+    # Extract API key securely using your existing multitenant architecture
+    tenant_config = config.get("configurable", {}).get("tenant_config", {})
+    tavily_api_key = tenant_config.get("tavily_api_key") or os.environ.get("TAVILY_API_KEY")
+    
+    if not tavily_api_key:
+        return "Error: TAVILY_API_KEY is missing. Cannot perform web search."
+    
+    try:
+        # LangChain's Tavily tool reads directly from the environment, so we temporarily inject it
+        os.environ["TAVILY_API_KEY"] = tavily_api_key
+        
+        # Initialize and run the native search
+        search = TavilySearch(max_results=3)
+        results = search.invoke({"query": query})
+        
+        return str(results)
+    except Exception as e:
+        return f"Web search failed: {str(e)}"
+
+@tool(args_schema=GenerateRepoMapInput)
+def generate_repo_map(config: RunnableConfig) -> str:
+    """Instantly maps the entire repository directory tree and reads all relevant file contents."""
+    workspace = config.get("configurable", {}).get("sandbox")
+    if not workspace:
+        return "Error: No active sandbox found in configuration."
+
+    # This Python script will run inside the E2B sandbox to rapidly aggregate the codebase
+    ingest_script = """
+    import os
+
+    def generate_map(root_dir):
+        ignore_dirs = {'.git', 'node_modules', 'venv', '.venv', '__pycache__', 'build', 'dist', '.next', '.firebase'}
+        ignore_exts = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.pdf', '.zip', '.tar', '.gz', '.mp4', '.pyc', '.lock'}
+        
+        tree_str = "DIRECTORY TREE:\\n================================================\\n"
+        content_str = "\\n\\nFILE CONTENTS:\\n================================================\\n"
+        
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            # Modify dirnames in-place to skip ignored directories
+            dirnames[:] = [d for d in dirnames if d not in ignore_dirs]
+            
+            level = dirpath.replace(root_dir, '').count(os.sep)
+            indent = ' ' * 4 * level
+            tree_str += f"{indent}{os.path.basename(dirpath)}/\\n"
+            
+            subindent = ' ' * 4 * (level + 1)
+            for f in filenames:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in ignore_exts or f.endswith('-lock.json'):
+                    continue
+                
+                tree_str += f"{subindent}{f}\\n"
+                
+                filepath = os.path.join(dirpath, f)
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as file:
+                        content = file.read()
+                        # Soft truncate massive files (e.g. minified bundles)
+                        if len(content) > 30000: 
+                            content = content[:30000] + "\\n\\n... [TRUNCATED DUE TO SIZE] ..."
+                        
+                        # Add to content output
+                        relative_path = filepath.replace(root_dir + '/', '')
+                        content_str += f"\\n--- FILE: {relative_path} ---\\n"
+                        content_str += f"{content}\\n"
+                except Exception:
+                    pass # Skip unreadable or binary files
+        
+        return tree_str + content_str
+
+    if __name__ == "__main__":
+        # Dynamically find the cloned git repository
+        cmd = "find /home/user -maxdepth 3 -type d -name '.git' | head -n 1"
+        git_dir = os.popen(cmd).read().strip()
+        
+        if git_dir:
+            repo_root = os.path.dirname(git_dir)
+            print(generate_map(repo_root))
+        else:
+            print("Error: No git repository found. You must clone the repository first.")
+    """
+    
+    try:
+        # Write the script to the sandbox and execute it
+        workspace.files.write("/home/user/ingest_repo.py", ingest_script)
+        res = workspace.commands.run("python3 /home/user/ingest_repo.py")
+        
+        output = res.stdout or res.stderr
+        return output if output else "Repository map generated, but it was empty."
+    except Exception as e:
+        return f"Failed to generate repository map: {str(e)}"
