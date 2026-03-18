@@ -2,6 +2,8 @@ import os
 import requests
 import base64
 import time
+import textwrap
+from typing import List
 from datetime import datetime
 from e2b_code_interpreter import Sandbox
 from pydantic import BaseModel, Field
@@ -12,14 +14,34 @@ import shlex
 
 # Create schemas to hide the 'workspace' parameter from the LLM
 class TerminalInput(BaseModel):
+    thought: str = Field(description="Your step-by-step reasoning for why this command is necessary and what you expect it to output.")
     command: str = Field(description="The shell command to execute")
 
 class ReadFileInput(BaseModel):
+    thought: str = Field(description="Explain WHY you are reading this file. If you already ran generate_repo_map, explain why that output was insufficient.")
     file_path: str = Field(description="Path to the file to read")
 
+class FileWriteDefinition(BaseModel):
+    file_path: str = Field(..., description="Path to the file to be written.")
+    content: str = Field(..., description="The full content of the file.")
+
+# --- Helper for Structured Thinking ---
+class BrainstormingOption(BaseModel):
+    approach_name: str = Field(..., description="Short name (e.g., 'Express Route Change')")
+    logic: str = Field(..., description="Technical breakdown of the implementation.")
+    pros_and_cons: str = Field(..., description="Compare this against other options.")
+
 class WriteFileInput(BaseModel):
-    file_path: str = Field(description="Path to the file")
-    content: str = Field(description="Content to write")
+    context_analysis: str = Field(description="If building a feature, summarize the current state and requirements. If fixing a bug, explain the root cause.")
+    # This is what forces the 'Tree of Thoughts' behavior.
+    brainstorming: List[BrainstormingOption] = Field(
+        ..., 
+        min_items=3, 
+        description="Propose exactly 3 distinct technical approaches. Do not commit to one yet."
+    )
+    critique_and_selection: str = Field(description="Critique the pros, cons, and edge cases of each approach proposed above. Then, explicitly state which approach you are choosing and why it is the most robust.")
+    implementation_plan: str = Field(description="Step-by-step strategy of how to execute the CHOSEN solution across the codebase.")
+    files: List[FileWriteDefinition] = Field(description="A list of files to create or edit. Work on frontend and backend files simultaneously.")
 
 class GitHubPRInput(BaseModel):
     ticket_id: str = Field(description="Linear ticket ID")
@@ -28,19 +50,22 @@ class GitHubPRInput(BaseModel):
     pr_body: str = Field(description="PR Body")
 
 class ManageDevServerInput(BaseModel):
+    thought: str = Field(description="Your reasoning for why you are starting, stopping, or checking logs.")
     action: str = Field(description="'start', 'logs', or 'stop'")
     command: str = Field(description="The server command (e.g., 'npm run dev'). Only needed for 'start'.", default="")
 
 class InspectFrontendInput(BaseModel):
+    thought: str = Field(description="Explain what you expect to see or test by inspecting the frontend.")
     url: str = Field(description="The local URL to inspect, e.g. http://localhost:5000")
 
 # Add this schema near your other Input schemas at the top of the file
 class WebSearchInput(BaseModel):
+    thought: str = Field(description="Explain what error or concept you are researching.")
     query: str = Field(description="The search query to look up on the internet (e.g., 'Firebase Express rewrite 404').")
 
 class GenerateRepoMapInput(BaseModel):
-    """No arguments required."""
-    pass
+    thought: str = Field(description="Confirm that you are mapping the repo to understand the architecture before writing code.")
+    target_dir: str = Field(description="The root directory to map. You MUST pass exactly '/home/user' as the value.")
 
 def _parse_github_time(ts_str: str) -> datetime:
     """Safely converts a GitHub ISO 8601 string to a datetime object."""
@@ -185,7 +210,7 @@ def get_best_resume_branch(ticket_id: str, github_token: str, repo_full: str) ->
     return winner
 
 @tool(args_schema=TerminalInput)
-def run_terminal_command(command: str, config: RunnableConfig) -> str:
+def run_terminal_command(thought: str, command: str, config: RunnableConfig) -> str:
     """
     Executes a bash command in the terminal. 
     Has a strict timeout. For background processes, use the 'start, curl, kill' pattern.
@@ -274,7 +299,7 @@ def run_terminal_command(command: str, config: RunnableConfig) -> str:
          return f"Terminal Error: {str(e)}"
 
 @tool(args_schema=ReadFileInput)
-def read_file(file_path: str, config: RunnableConfig) -> str:
+def read_file(thought: str, file_path: str, config: RunnableConfig) -> str:
     """Reads the full contents of a file inside the workspace."""
 
     workspace = config.get("configurable", {}).get("sandbox")
@@ -287,17 +312,44 @@ def read_file(file_path: str, config: RunnableConfig) -> str:
         return f"Error reading file: {str(e)}"
 
 @tool(args_schema=WriteFileInput)
-def write_file(file_path: str, content: str, config: RunnableConfig) -> str:
-    """Overwrites a file (or creates a new one) inside the workspace with new code."""
+def write_file(context_analysis: str, brainstorming: list, critique_and_selection: str, implementation_plan: str, files: list, config: RunnableConfig) -> str:
+    """Creates multiple files (or overwrites existing) inside the workspace simultaneously. Use this to keep frontend and backend logic in sync in a single turn."""
     workspace = config.get("configurable", {}).get("sandbox")
     if not workspace:
         return "Error: No active sandbox found in configuration."
 
-    try:
-        workspace.files.write(file_path, content)
-        return f"Successfully saved changes to {file_path}"
-    except Exception as e:
-        return f"Error writing file: {str(e)}"
+    results = []
+
+    # Format the structured brainstorming list into a readable string for the logs
+    brainstorming_text = "\n".join([
+        f"- {option.approach_name}: {option.logic} (Pros/Cons: {option.pros_and_cons})" 
+        for option in brainstorming
+    ])
+    
+    # Log the AI's entire cognitive process internally
+    cognitive_log = (
+        f"ANALYSIS: {context_analysis}\n"
+        f"BRAINSTORMING PATHS:\n{brainstorming_text}\n"
+        f"CRITIQUE: {critique_and_selection}\n"
+        f"PLAN: {implementation_plan}\n"
+    )
+    results.append(cognitive_log)
+    
+    for f in files:
+        file_path = f.file_path
+        content = f.content
+        
+        if not file_path or not content:
+            results.append(f"Error: Missing file_path or content in one of the file objects.")
+            continue
+            
+        try:
+            workspace.files.write(file_path, content)
+            results.append(f"Successfully saved changes to {file_path}")
+        except Exception as e:
+            results.append(f"Error writing {file_path}: {str(e)}")
+            
+    return "\n".join(results)
 
 @tool
 def update_linear_ticket(message: str, config: RunnableConfig) -> str:
@@ -473,8 +525,8 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
         else:
             return f"Git push succeeded, but PR creation failed: {pr_resp.text}"
 
-@tool
-def sync_wip_commit(commit_message: str, config: RunnableConfig) -> str:
+tool
+def sync_wip_commit(thought: str, commit_message: str, config: RunnableConfig) -> str:
     """
     Saves your current progress to a temporary remote WIP branch so it is not lost if the server crashes.
     Call this whenever you finish writing a significant piece of code, before moving on.
@@ -532,7 +584,7 @@ def sync_wip_commit(commit_message: str, config: RunnableConfig) -> str:
         return f"WIP Sync execution failed: {str(e)}"
 
 @tool(args_schema=ManageDevServerInput)
-def manage_dev_server(action: str, command: str, config: RunnableConfig) -> str:
+def manage_dev_server(thought: str, action: str, command: str, config: RunnableConfig) -> str:
     """Manages background development servers. Use this to start a server without timing out, check its logs, and stop it."""
     workspace = config.get("configurable", {}).get("sandbox")
     if not workspace: return "Error: No active sandbox."
@@ -652,7 +704,7 @@ def manage_dev_server(action: str, command: str, config: RunnableConfig) -> str:
     return "Invalid action."
 
 @tool(args_schema=InspectFrontendInput)
-def inspect_frontend(url: str, config: RunnableConfig) -> str:
+def inspect_frontend(thought: str, url: str, config: RunnableConfig) -> str:
     """Opens a headless browser, navigates to the URL, and returns console errors and network failures."""
     workspace = config.get("configurable", {}).get("sandbox")
     if not workspace:
@@ -691,7 +743,7 @@ def inspect_frontend(url: str, config: RunnableConfig) -> str:
     return res.stdout or res.stderr
 
 @tool(args_schema=WebSearchInput)
-def web_search(query: str, config: RunnableConfig) -> str:
+def web_search(thought: str, query: str, config: RunnableConfig) -> str:
     """Searches the internet for framework documentation, tutorials, or solutions to persistent errors."""
     
     # Extract API key securely using your existing multitenant architecture
@@ -714,14 +766,14 @@ def web_search(query: str, config: RunnableConfig) -> str:
         return f"Web search failed: {str(e)}"
 
 @tool(args_schema=GenerateRepoMapInput)
-def generate_repo_map(config: RunnableConfig) -> str:
+def generate_repo_map(thought: str, target_dir: str, config: RunnableConfig) -> str:
     """Instantly maps the entire repository directory tree and reads all relevant file contents."""
     workspace = config.get("configurable", {}).get("sandbox")
     if not workspace:
         return "Error: No active sandbox found in configuration."
 
     # This Python script will run inside the E2B sandbox to rapidly aggregate the codebase
-    ingest_script = """
+    ingest_script = textwrap.dedent("""
     import os
 
     def generate_map(root_dir):
@@ -774,7 +826,7 @@ def generate_repo_map(config: RunnableConfig) -> str:
             print(generate_map(repo_root))
         else:
             print("Error: No git repository found. You must clone the repository first.")
-    """
+    """)
     
     try:
         # Write the script to the sandbox and execute it

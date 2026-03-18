@@ -19,7 +19,8 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
     retry_if_exception_type,
-    retry_if_result
+    retry_if_result,
+    retry_if_exception
 )
 # Import the specific LangChain Google error
 from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
@@ -49,7 +50,7 @@ def is_retryable_error(exception):
 # wait_exponential(multiplier=1, min=4, max=60) means:
 # Wait 4s, 8s, 16s, 32s, then capped at 60s between retries.
 llm_retry_decorator = retry(
-    retry=retry_if_exception_type((ChatGoogleGenerativeAIError, google_exceptions.ResourceExhausted)),
+    retry=retry_if_exception(is_retryable_error),
     wait=wait_exponential(multiplier=1, min=4, max=60), 
     stop=stop_after_attempt(5),
     before_sleep=lambda retry_state: print(f"Quota exhausted. Retrying in {retry_state.next_action.sleep} seconds...")
@@ -262,11 +263,32 @@ def filter_agent_history(messages: list, agent_role: str) -> list:
     def get_total_length(msgs):
         return sum(len(str(getattr(m, "content", ""))) for m in msgs)
 
+    # --- FIND LATEST CURRENT-SESSION REPO MAP ---
+    # 1. Find the start index of the current session in the filtered array
+    current_session_start_idx = 0
+    for i, msg in enumerate(filtered_messages):
+        if getattr(msg, "additional_kwargs", {}).get("source") == "webhook":
+            current_session_start_idx = i
+            
+    # 2. Find the index of the latest generate_repo_map inside the current session
+    protected_repo_map_idx = -1
+    for i in range(len(filtered_messages) - 1, current_session_start_idx - 1, -1):
+        msg = filtered_messages[i]
+        if getattr(msg, "type", "") == "tool" and getattr(msg, "name", "") == "generate_repo_map":
+            protected_repo_map_idx = i
+            break # Found the most recent one, stop looking
+    # -------------------------------------------------
+
     if get_total_length(filtered_messages) > MAX_CHARS_THRESHOLD:
         # Loop from the oldest message forward, stopping before the protected window
         for i in range(len(filtered_messages) - PROTECTED_WINDOW):
             msg = filtered_messages[i]
             
+            # --- IMMUNITY CHECK ---
+            if i == protected_repo_map_idx:
+                continue # Skip truncation entirely to preserve the full map
+            # ---------------------------
+
             # We only truncate massive Tool Output messages (skip AI thoughts and Human prompts)
             if getattr(msg, "type", "") == "tool" and len(str(msg.content)) > 2000:
                 
@@ -283,6 +305,14 @@ def filter_agent_history(messages: list, agent_role: str) -> list:
                         f"If you need to reference this file again, use the read_file tool.\n"
                         f"</system_memory_manager>"
                     )
+                # --- COMPLETELY REMOVE OLD REPO MAPS ---
+                elif tool_name == "generate_repo_map":
+                    new_msg.content = (
+                        f"<system_memory_manager>\n"
+                        f"Legacy repo map completely removed to save context space. (Original size: {len(content_str)} chars).\n"
+                        f"</system_memory_manager>"
+                    )
+                # ----------------------------------------------
                 elif tool_name == "run_terminal_command":
                     # For terminal commands, the exit code/error is almost always at the very end.
                     new_msg.content = (
@@ -635,32 +665,35 @@ def developer_node(state: AgencyState) -> dict:
         f"AVAILABLE SKILLS:\n{dynamic_skills}\n\n"
 
         "PROCESS PHASE: Implementation & Testing. In this phase, you follow this lifecycle:\n"
-        "1. Environment Initialization: Preparing the workspace and cloning the repo.\n"
+        "1. Environment Initialization: Verifying the workspace is ready (the repository is usually auto-cloned for you, but you must clone it manually if the directory is empty).\n"
         "2. Codebase Exploration: Understanding existing patterns and architecture.\n"
         "3. Implementation: Writing clean, modular, and functional code.\n"
         "4. Verification: Running tests and executing code to ensure zero regressions.\n\n"
 
-        "PROCESS-TO-SKILL MAPPING:\n"
-        "- Initialization/Verification: Use `run_terminal_command` for git, pytest, and execution.\n"
-        "- Exploration: Use `read_file` to examine code logic.\n"
-        "- Implementation: Use `write_file` to create or modify code.\n"
-        "- Backup/Saving: Use `sync_wip_commit` to save your progress remotely.\n\n"
+       "PROCESS-TO-SKILL MAPPING:\n"
+        "- Architecture Ingestion: Use `generate_repo_map` as your mandatory first step to map the entire directory tree and file contents.\n"
+        "- Exploration & Implementation: generate_repo_map already places file contents in your memory. Do NOT use read_file unless the file has been modified since the map was generated. Use `write_file` to execute your implementation plan across multiple files simultaneously.\n"
+        "- Server Management: Use `manage_dev_server` to safely start, monitor logs, and stop background processes (e.g., dev servers, emulators) without causing timeouts.\n"
+        "- Observation & Verification: Use `inspect_frontend` to test live URLs for browser console errors, and `run_terminal_command` for short-lived unit tests or scripts.\n"
+        "- Research & Debugging: Use `web_search` to look up framework documentation or solutions to persistent errors before guessing.\n"
+        "- Backup/Saving: Use `sync_wip_commit` to save your progress remotely after major changes.\n"
+        "- Progress Reporting: Use `ReportStatus` to yield control back to the Manager when you finish a chunk of work, hit a blocker, or complete the feature.\n\n"
 
         "YOUR INSTRUCTIONS:\n"
-        "1. Work through the process step-by-step. After every tool call, analyze the output before deciding your next move. You can call `write_file` and immediately call `sync_wip_commit` in the exact same response to save time.\n"
+        "1. Work through the process step-by-step. After every tool call, analyze the output before deciding your next move. The ReAct Framework is enforced: EVERY tool requires a `thought` parameter. You MUST use this parameter to explain your exact logical reasoning before the tool executes. E.g., If you are about to use `read_file`, use the `thought` parameter to check your memory first to see if you already know the file contents from `generate_repo_map`.\n"
+        #"2. Parallel Tool Calling: You can call `write_file` and immediately call `sync_wip_commit` in the exact same response to save time.\n"
         #"1. Work through the process intelligently. You are encouraged to BATCH multiple tool calls in a single turn whenever possible to save time. For example, you can call `write_file` and immediately call `sync_wip_commit` in the exact same response.\n"
         "2. Initialization & Discovery:\n"
-        "   - Clone & Entry: If the repo is not cloned, run git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git. Run ls to observe the folder name and cd into it before modifying files.\n"
-        "   - Codebase Ingestion (CRITICAL): Once the code is cloned, you MUST immediately call the `generate_repo_map` tool to ingest the entire repository layout and file contents into your memory.\n"
+        "   - Clone & Entry: Verify the workspace is ready. The repository is usually auto-cloned for you, but you must run `git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git` if the directory is completely empty.\n"
+        "   - Codebase Ingestion (CRITICAL): MANDATORY FIRST STEP. You MUST immediately call the `generate_repo_map` tool (target_dir='/home/user') to ingest the entire repository layout and file contents into your memory.\n"
         "   - Secrets Discovery (Presence): Run env | grep _API_ or printenv immediately to identify secrets injected by the system vault. If a required key (e.g., NEWS_API_KEY) is present, it is live; never report 'BLOCKED' due to a missing key if it appears in this output.\n"
         "   - Functional Verification (Validity): Presence does not equal functionality. You MUST verify key validity during the 'Verification' phase. If a key is present in env but triggers a 401 or Unauthorized error during a live test or server boot, report 'BLOCKED' and specify that the key is invalid.\n"
         "   - Dependencies: Check for manifest files (package.json, requirements.txt, pom.xml). You MUST run the appropriate install command (npm install, pip install -r requirements.txt) in that directory before starting servers or running tests.\n"
-        "3. Codebase Exploration: Do NOT guess file paths. Use the output from `generate_repo_map` to build your 'System Map'. Do NOT use `ls -R` or `read_file` to explore the project initially, as `generate_repo_map` provides the complete architecture. Use this holistic map to locate your 'Source of Truth' files and Entry Points before modifying any code.\n"
-        #"3. Codebase Exploration: Do NOT guess file paths. If you just cloned the code, all files are located inside the folder you observed in the previous step. When using `read_file` or `write_file`, you must include that folder name at the start of your path. Your first priority is to build a 'System Map':\n"
-        #"   - Run `ls -R` to understand the full directory hierarchy. If you receive a No such file or directory error, immediately run pwd and ls -R to re-orient yourself.\n"
-        #"   - Identify and read the 'Source of Truth' files: Look for dependency manifests (e.g., package.json, requirements.txt, pyproject.toml) and core schemas or state definitions.\n"
-        #"   - Locate the main Entry Points (e.g., main.py, index.js, app.py, or Dockerfiles) to understand the execution flow.\n"
-        #"   - Use this information to create a mental map of the architecture before modifying any code. This ensures you respect existing design patterns and folder structures.\n"
+        "3. Codebase Exploration: Do NOT guess file paths. Use the output from `generate_repo_map` to build your 'System Map'. When using `read_file` or `write_file`, ensure you use the exact paths shown in the map. Your priorities are:\n"
+        "   - Identify 'Source of Truth' files: Look for dependency manifests (e.g., package.json, requirements.txt) and core schemas or state definitions.\n"
+        "   - Locate the main Entry Points: Look for files like main.py, index.js, app.py, or Dockerfiles to understand the execution flow.\n"
+        "   - Use this information to create a mental map of the architecture. You MUST respect existing design patterns and folder structures when writing new code.\n"
+        "   - If you receive a 'No such file or directory' error, immediately run `pwd` and `ls -la` to re-orient yourself.\n"
         
         "4. Progress Evaluation & Completion: You must intelligently evaluate your progress against the original request. You MUST call the `ReportStatus` tool to yield control back to the Manager, selecting ONE of the following three states:\n"
         "4.1. STATE: 'COMPLETE'\n"
@@ -689,10 +722,10 @@ def developer_node(state: AgencyState) -> dict:
         "- Add subtle hover states and CSS transitions to make the UI feel interactive.\n\n"
 
         "ROBUST API ERROR HANDLING (THE SILENT 200 TRAP):\n"
-        "- When writing backend Express.js code that fetches data from external APIs, do NOT rely solely on `response.ok`. Many third-party APIs return error payloads disguised as 200 OK responses (e.g., `{ \"status\": \"error\", \"message\": \"Quota exceeded\" }`).\n"
+        "- When writing backend API routes in ANY framework, do NOT rely solely on HTTP status codes or `response.ok`. Many third-party APIs return error payloads disguised as 200 OK responses (e.g., `{ \"status\": \"error\", \"message\": \"Quota exceeded\" }`).\n"
         "- You MUST always parse the JSON response from the external API and check for logical error fields (such as `error`, `status: 'error'`, `success: false`, or `fault`).\n"
-        "- If the external API payload contains a logical error, your Express route MUST forcefully throw an error or return `res.status(400)` / `res.status(500)`. This guarantees that your frontend `fetch` catches the failure and logs a console error, allowing `inspect_frontend` to observe the bug.\n\n"
-
+        "- If the external API payload contains a logical error, your backend route MUST forcefully throw an exception or return an explicit 400/500 HTTP error status. This guarantees that your frontend HTTP clients catch the failure and log a console error, allowing `inspect_frontend` to observe the bug.\n\n"
+        
         "CI/CD & SECRETS MANAGEMENT:\n"
         "1. `.env.example`: Whenever you introduce a new environment variable (e.g., `process.env.STRIPE_KEY`), you MUST document it by adding the variable name to a `.env.example` file at the root of the project.\n"
         "2. GitHub Actions / Firebase Auto-Deploy: If the project uses GitHub Actions (check `.github/workflows/` for `.yml` files), the CI/CD pipeline will fail if it cannot access the new secret. You MUST update the workflow `.yml` file to inject the secret into the build or deploy step. Map the environment variable to the GitHub Secret exactly like this under the `env:` block of the relevant step:\n"
@@ -718,7 +751,7 @@ def developer_node(state: AgencyState) -> dict:
         "4. THE H-R-A-O LOOP: When fixing a bug or using an unfamiliar framework, you MUST follow this loop:\n"
         "   - Hypothesis: State what you think is wrong.\n"
         "   - Research (CRITICAL): If you encounter a persistent error (like a 404, compilation failure, or missing dependency) DO NOT GUESS. You MUST use the `web_search` tool to search for the specific error message or framework documentation (e.g., 'Firebase Express rewrite 404').\n"
-        "   - Action: Use `write_file` or `run_terminal_command` to implement the researched solution.\n"
+        "   - Action: Use `write_file` or `run_terminal_command` to implement the researched solution. You MUST edit both the frontend caller and backend receiver files in the EXACT SAME `write_file` call to prevent intermediate broken states.\n"
         "   - Observation: You MUST test the code via `manage_dev_server` or `inspect_frontend` to observe if it worked before declaring the task COMPLETE.\n"
         "5. AVOID HALLUCINATION: Frameworks update constantly. If you are unsure how a specific configuration file (like firebase.json, next.config.js, or Dockerfiles) handles routing or ports, use the `web_search` tool before writing code.\n"
         "6. SERVER MANAGEMENT & WAITING: Never use `run_terminal_command` to start a web server (it will cause a timeout). You MUST use the `manage_dev_server` tool to start/stop servers in the background (e.g., `manage_dev_server(action='start', command='npx firebase emulators:start')`). IMPORTANT: The tool will automatically pause and wait for the server to boot before returning the initial logs to you. You do not need to wait multiple turns. If the boot was successful, you can immediately test the port or call `inspect_frontend` in your very next turn.\n"

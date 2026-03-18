@@ -168,13 +168,5 @@ workflow.add_conditional_edges(
     {"Manager": "Manager", "DevOps": "DevOps"}
 )
 
-# 1. Create a persistent SQLite connection
-# check_same_thread=False is crucial for FastAPI so it doesn't crash on concurrent requests
-conn = sqlite3.connect("checkpoints.sqlite", check_same_thread=False, isolation_level=None)
-
-# 2. Initialize the memory saver with the connection
-memory = SqliteSaver(conn)
-memory.setup()
-
-# 3. Compile the workflow
-app = workflow.compile(checkpointer=memory)
+# Export the uncompiled workflow so main.py can compile it per-thread
+# (The 'workflow = StateGraph(AgencyState)' definition already exists above)
