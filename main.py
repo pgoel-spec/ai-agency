@@ -438,7 +438,7 @@ async def api_get_session_logs(ticket_id: str, session_id: str):
 # 2. THE HTML UI (Auto-Polling Viewer)
 # ==========================================
 def get_log_viewer_html(page_title: str, api_endpoint: str):
-    """Generates an HTML page with a Sidebar, View Filters, and Copy features."""
+    """Generates an HTML page with an interactive Timeline, Copy features, and consistent Log Viewer."""
     return f"""
     <html>
         <head>
@@ -461,7 +461,7 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                 
                 /* Layout */
                 .layout {{ display: flex; flex: 1; overflow: hidden; }}
-                .main-content {{ flex: 1; overflow-y: auto; padding: 10px 15px; display: flex; flex-direction: column; gap: 4px; scroll-behavior: smooth; }}
+                .main-content {{ flex: 1; overflow-y: auto; padding: 10px 15px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; }}
                 
                 /* Sidebar */
                 .sidebar {{ width: 280px; background: #252526; border-right: 1px solid #444; display: flex; flex-direction: column; flex-shrink: 0; transition: width 0.3s ease; overflow: hidden; }}
@@ -491,20 +491,31 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                 .status-dot {{ height: 8px; width: 8px; background-color: #4ade80; border-radius: 50%; display: inline-block; box-shadow: 0 0 6px #4ade80; }}
                 
                 /* Log Cards */
-                .log-card {{ background: #252526; padding: 4px 6px; border-radius: 2px; border-left: 3px solid #4fc1ff; transition: background-color 0.5s ease; }}
+                .log-card {{ background: #252526; padding: 0 0 8px 0; border-radius: 4px; border-left: 3px solid #4fc1ff; border-bottom: 1px dashed #333; transition: background-color 0.5s ease; overflow: hidden; }}
                 .log-card.error {{ border-left-color: #f43f5e; }}
                 .log-card.human {{ border-left-color: #a855f7; }}
                 
-                /* Flash Animation for when navigating from Sidebar */
                 .log-card.flash-highlight {{ animation: flashAnim 2s ease-out; }}
                 @keyframes flashAnim {{ 0% {{ background-color: #5a5a5a; }} 100% {{ background-color: #252526; }} }}
                 
-                .log-meta {{ font-size: 0.75em; color: #858585; margin-bottom: 2px; border-bottom: 1px dashed #333; padding-bottom: 2px; display: flex; justify-content: space-between; align-items: center; }}
+                .log-meta {{ font-size: 0.75em; color: #858585; background: transparent; padding: 8px 12px; border-bottom: 1px dashed #333; display: flex; justify-content: space-between; align-items: center; }}
                 .log-meta-left {{ display: flex; gap: 6px; align-items: center; }}
                 .log-meta-right {{ display: flex; align-items: center; gap: 10px; }}
                 
-                .copy-btn {{ background: none; border: 1px solid #555; color: #aaa; border-radius: 3px; cursor: pointer; font-family: -apple-system, sans-serif; font-size: 0.9em; padding: 1px 6px; transition: 0.1s; }}
-                .copy-btn:hover {{ background: #4fc1ff; color: #000; border-color: #4fc1ff; }}
+                /* Universal Dropdown Styles (For Copy only) */
+                .dropdown {{ position: relative; display: inline-block; }}
+                .dropdown-content {{ display: none; position: absolute; right: 0; top: 100%; background-color: #252526; min-width: 150px; box-shadow: 0px 4px 12px rgba(0,0,0,0.5); z-index: 100; border-radius: 3px; border: 1px solid #444; overflow: hidden; }}
+                .dropdown-content button {{ color: #d4d4d4; padding: 8px 12px; text-decoration: none; display: block; background: none; border: none; width: 100%; text-align: left; cursor: pointer; font-family: -apple-system, sans-serif; font-size: 0.9em; transition: background 0.1s; }}
+                .dropdown-content button:hover {{ background-color: #4fc1ff; color: #000; }}
+                .dropdown:hover .dropdown-content {{ display: block; }}
+                
+                /* Synchronized Button Styles */
+                .copy-btn {{ background: none; border: 1px solid #555; color: #aaa; border-radius: 3px; cursor: pointer; font-family: -apple-system, sans-serif; font-size: 0.85em; padding: 2px 6px; transition: 0.1s; display: flex; align-items: center; gap: 4px; }}
+                .copy-btn:hover {{ background: #333; color: #fff; border-color: #888; }}
+                
+                .toggle-btn {{ display: none; background: none; border: none; color: #4fc1ff; cursor: pointer; padding: 0; font-family: -apple-system, sans-serif; font-size: 0.85em; transition: 0.1s; align-items: center; gap: 4px; }}
+                .toggle-btn:hover {{ color: #fff; text-decoration: underline; }}
+                .log-card.expandable .toggle-btn {{ display: flex; }}
                 
                 .token-container {{ display: flex; align-items: center; gap: 6px; background: #1e1e1e; padding: 2px 6px; border-radius: 3px; border: 1px solid #333; }}
                 .token-bar {{ width: 50px; height: 6px; background: #333; border-radius: 3px; overflow: hidden; }}
@@ -513,18 +524,46 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                 .token-fill.danger {{ background: #f43f5e; box-shadow: 0 0 4px #f43f5e; }}
                 .token-text {{ font-size: 0.9em; font-family: monospace; color: #aaa; min-width: 65px; text-align: right; }}
                 
-                .log-content {{ font-size: 0.85em; line-height: 1.15; margin: 0; max-height: 4.6em; overflow: hidden; white-space: pre-wrap; word-wrap: break-word; }}
-                .log-card.expanded .log-content {{ max-height: none; }}
-                
-                .toggle-btn {{ display: none; background: none; border: none; color: #4fc1ff; cursor: pointer; padding: 0; font-family: monospace; font-size: 1.1em; font-weight: bold; }}
-                .toggle-btn:hover {{ text-decoration: underline; }}
-                .log-card.expandable .toggle-btn {{ display: inline-block; }}
+                /* EXACT FIXED HEIGHT */
+                .log-content {{ 
+                    font-size: 0.85em; 
+                    line-height: 1.2;
+                    margin: 0; 
+                    padding: 8px 12px;
+                    max-height: 4.8em; 
+                    overflow: hidden; 
+                    white-space: pre-wrap; 
+                    word-wrap: break-word;
+                }}
+                .log-card.expanded .log-content {{ 
+                    max-height: none; 
+                    overflow: auto; 
+                }}
 
                 /* View Filters Logic */
                 body.hide-prompts .role-ai_prompt {{ display: none; }}
                 body.hide-tools .role-tool_output {{ display: none; }}
                 body.hide-raw .role-ai_raw_response {{ display: none; }}
                 body.hide-traces .role-system_trace {{ display: none; }}
+
+                /* BARE-METAL JSON VIEWER */
+                .json-viewer {{ font-family: inherit; white-space: pre-wrap; word-break: break-word; color: #d4d4d4; }}
+                
+                /* Inline Node Controls - Flowing naturally next to the node name */
+                .node-controls {{ margin-left: 12px; font-size: 0.9em; color: #858585; display: inline-block; font-weight: normal; }}
+                .node-controls span {{ cursor: pointer; transition: 0.1s; }}
+                .node-controls span:hover {{ text-decoration: underline; color: #fff; }}
+                
+                details.json-node {{ margin: 2px 0; font-size: inherit; }}
+                details.json-node > summary {{ cursor: pointer; color: #d4d4d4; user-select: none; font-weight: normal; outline: none; margin-left: -4px; padding-left: 4px; border-radius: 3px; display: inline-block; transition: 0.1s; font-size: inherit; }}
+                details.json-node > summary:hover {{ background-color: #333; }}
+                .json-children {{ margin-left: 12px; padding-left: 8px; border-left: 1px dashed #555; font-size: inherit; }}
+                .json-row {{ margin: 2px 0; display: flex; align-items: flex-start; flex-wrap: wrap; gap: 4px; font-size: inherit; }}
+                .json-key {{ color: #d4d4d4; margin-right: 4px; white-space: nowrap; flex-shrink: 0; font-size: inherit; }}
+                .json-string {{ color: #d4d4d4; word-break: break-word; white-space: pre-wrap; flex: 1; min-width: 0; font-size: inherit; }}
+                .json-number {{ color: #d4d4d4; font-size: inherit; }}
+                .json-boolean {{ color: #d4d4d4; font-size: inherit; }}
+                .json-null {{ color: #aaa; font-style: italic; font-size: inherit; }}
             </style>
         </head>
         <body>
@@ -570,7 +609,7 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
             </div>
 
             <script>
-                let rawLogData = []; // Store raw text for copying
+                let rawLogData = []; 
                 let knownLogCount = 0;
                 let isAutoScrollEnabled = true;
                 let allExpanded = false;
@@ -578,7 +617,6 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                 
                 const TOKEN_LIMIT = 10000;
 
-                // Set default filters based on checkboxes
                 document.body.classList.add('hide-raw', 'hide-traces');
 
                 const mainScrollArea = document.getElementById('main-scroll-area');
@@ -589,10 +627,56 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                     isAutoScrollEnabled = (pageHeight - scrollPosition < 30);
                 }});
 
+                // SCROLL PRESERVATION LOGIC
+                function preserveScroll(btn, actionFn) {{
+                    const rectBefore = btn.getBoundingClientRect();
+                    actionFn();
+                    const rectAfter = btn.getBoundingClientRect();
+                    const diff = rectAfter.top - rectBefore.top;
+                    if (diff !== 0) {{
+                        mainScrollArea.scrollTop += diff;
+                    }}
+                }}
+
                 function toggleSingleCard(btn, id) {{
-                    const card = document.getElementById(`card-${{id}}`);
-                    card.classList.toggle('expanded');
-                    btn.innerText = card.classList.contains('expanded') ? '▲ Collapse' : '▼ Expand';
+                    preserveScroll(btn, () => {{
+                        const card = document.getElementById(`card-${{id}}`);
+                        const isExpanded = card.classList.contains('expanded');
+                        
+                        if (!isExpanded) {{
+                            card.classList.add('expanded');
+                            btn.innerHTML = '<span style="font-family: monospace; font-size: 1.1em; font-weight: bold; pointer-events: none;">▲</span> Collapse';
+                        }} else {{
+                            card.classList.remove('expanded');
+                            btn.innerHTML = '<span style="font-family: monospace; font-size: 1.1em; font-weight: bold; pointer-events: none;">▼</span> Expand';
+                        }}
+                    }});
+                }}
+                
+                function expandNodes(e, el) {{
+                    e.preventDefault(); // Prevents the <summary> tag from natively toggling
+                    e.stopPropagation();
+                    preserveScroll(el, () => {{
+                        const viewer = el.closest('.json-viewer');
+                        const details = viewer.querySelectorAll('details.json-node');
+                        details.forEach(d => d.open = true);
+                    }});
+                }}
+
+                function collapseNodes(e, el) {{
+                    e.preventDefault(); // Prevents the <summary> tag from natively toggling
+                    e.stopPropagation();
+                    preserveScroll(el, () => {{
+                        const viewer = el.closest('.json-viewer');
+                        const details = viewer.querySelectorAll('details.json-node');
+                        details.forEach(d => {{
+                            if (d.parentElement.classList.contains('json-viewer')) {{
+                                d.open = true; // Keep the absolute root open
+                            }} else {{
+                                d.open = false; // Collapse all children
+                            }}
+                        }});
+                    }});
                 }}
 
                 function setAllCards(expand) {{
@@ -602,73 +686,74 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                         const toggleBtn = card.querySelector('.toggle-btn');
                         if (expand) {{
                             card.classList.add('expanded');
-                            toggleBtn.innerText = '▲ Collapse';
+                            if (toggleBtn) toggleBtn.innerHTML = '<span style="font-family: monospace; font-size: 1.1em; font-weight: bold; pointer-events: none;">▲</span> Collapse';
                         }} else {{
                             card.classList.remove('expanded');
-                            toggleBtn.innerText = '▼ Expand';
+                            if (toggleBtn) toggleBtn.innerHTML = '<span style="font-family: monospace; font-size: 1.1em; font-weight: bold; pointer-events: none;">▼</span> Expand';
                         }}
                     }});
                 }}
 
-                // Toggle the sidebar width
                 function toggleSidebar() {{
                     const sidebar = document.getElementById('checkpoint-sidebar');
                     const btn = document.getElementById('toggle-sidebar-btn');
-                    
                     sidebar.classList.toggle('collapsed');
-                    
-                    // Change arrow direction based on state
-                    if (sidebar.classList.contains('collapsed')) {{
-                        btn.innerText = '▶';
-                    }} else {{
-                        btn.innerText = '◀';
-                    }}
+                    btn.innerText = sidebar.classList.contains('collapsed') ? '▶' : '◀';
                 }}
 
-                // Copy entire un-truncated text to clipboard
-                async function copyText(btn, index) {{
+                async function copyText(btn, index, stripThoughts = false) {{
                     try {{
-                        const rawText = rawLogData[index].content;
+                        let rawText = rawLogData[index].content;
+                        
+                        if (stripThoughts) {{
+                            try {{
+                                let parsedData = JSON.parse(rawText);
+                                function removeThoughts(obj) {{
+                                    if (typeof obj !== 'object' || obj === null) return;
+                                    if (Array.isArray(obj)) {{
+                                        obj.forEach(removeThoughts);
+                                    }} else {{
+                                        if ('__gemini_function_call_thought_signatures__' in obj) {{
+                                            delete obj['__gemini_function_call_thought_signatures__'];
+                                        }}
+                                        Object.values(obj).forEach(removeThoughts);
+                                    }}
+                                }}
+                                removeThoughts(parsedData);
+                                rawText = JSON.stringify(parsedData, null, 2);
+                            }} catch (e) {{
+                                rawText = rawText.replace(/"__gemini_function_call_thought_signatures__"\\s*:\\s*\\[[\\s\\S]*?\\](,\\s*|\\s*(?=\\}}))/g, '');
+                            }}
+                        }}
+
                         await navigator.clipboard.writeText(rawText);
                         
-                        // Visual feedback
-                        const originalText = btn.innerText;
-                        btn.innerText = "✓ Copied";
+                        const originalText = btn.innerHTML;
+                        btn.innerHTML = "✓ Copied";
                         btn.style.color = "#4ade80";
-                        btn.style.borderColor = "#4ade80";
                         
                         setTimeout(() => {{
-                            btn.innerText = originalText;
+                            btn.innerHTML = originalText;
                             btn.style.color = "";
-                            btn.style.borderColor = "";
                         }}, 2000);
                     }} catch (err) {{
                         console.error('Failed to copy text: ', err);
-                        btn.innerText = "Failed";
+                        btn.innerHTML = "Failed";
                     }}
                 }}
 
-                // Navigate to a specific card from the sidebar
                 function jumpToCard(index) {{
                     const card = document.getElementById(`card-${{index}}`);
                     if (card) {{
-                        // Temporarily remove any hidden classes to ensure it's visible
-                        const roleClass = 'role-' + rawLogData[index].role;
-                        const bodyHadClass = document.body.classList.contains('hide-' + rawLogData[index].role.split('_')[0]); // rough check
-                        
                         card.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
-                        
-                        // Reset animation
                         card.classList.remove('flash-highlight');
-                        void card.offsetWidth; // Trigger reflow
+                        void card.offsetWidth;
                         card.classList.add('flash-highlight');
                     }}
                 }}
 
                 function appendCheckpoint(index, type, label, summary, timestamp) {{
                     const sidebar = document.getElementById('sidebar-list');
-                    
-                    // Safely remove only the placeholder
                     const placeholder = document.getElementById('cp-placeholder');
                     if (placeholder) placeholder.remove(); 
                     
@@ -683,6 +768,72 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                     `;
                     sidebar.appendChild(li);
                 }}
+
+                // --- Universal Log Formatter ---
+                function formatLogContent(rawText) {{
+                    if (!rawText) return '';
+                    const trimmed = String(rawText).trim();
+                    
+                    if ((trimmed.startsWith('{{') && trimmed.endsWith('}}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {{
+                        try {{
+                            const parsed = JSON.parse(trimmed);
+                            // We pass 'true' for isRoot so the first node embeds the controls inline
+                            return '<div class="json-viewer">' + renderJsonTree(parsed, 0, '', false, true) + '</div>';
+                        }} catch (e) {{
+                            // Fails safely if it's just raw text that happens to have brackets
+                        }}
+                    }}
+                    return escapeHTML(rawText);
+                }}
+
+                function renderJsonTree(data, depth, key = '', isArrayIndex = false, isRoot = false) {{
+                    let keyHtml = '';
+                    if (key !== '') {{
+                        keyHtml = isArrayIndex ? '<span class="json-key">' + key + ':</span> ' : '<span class="json-key">"' + escapeHTML(key) + '":</span> ';
+                    }}
+
+                    // Inline Controls injected seamlessly after the root node text
+                    let controlsHtml = isRoot ? ' <span class="node-controls"><span onclick="expandNodes(event, this)">Expand All</span> &nbsp;|&nbsp; <span onclick="collapseNodes(event, this)">Collapse All</span></span>' : '';
+
+                    if (data === null) return '<div class="json-row">' + keyHtml + '<span class="json-null">null</span></div>';
+                    if (typeof data === 'boolean') return '<div class="json-row">' + keyHtml + '<span class="json-boolean">' + data + '</span></div>';
+                    if (typeof data === 'number') return '<div class="json-row">' + keyHtml + '<span class="json-number">' + data + '</span></div>';
+                    
+                    if (typeof data === 'string') {{
+                        if (data.includes('\\n') || data.length > 150) {{
+                            let html = '<details class="json-node" ' + (depth < 3 ? 'open' : '') + '><summary>' + keyHtml + 'String [' + data.length + ' chars]' + controlsHtml + '</summary><div class="json-children">';
+                            html += '<div class="json-row"><span class="json-string">"' + escapeHTML(data) + '"</span></div>';
+                            html += '</div></details>';
+                            return html;
+                        }}
+                        return '<div class="json-row">' + keyHtml + '<span class="json-string">"' + escapeHTML(data) + '"</span></div>';
+                    }}
+
+                    const openAttr = depth < 3 ? 'open' : '';
+
+                    if (Array.isArray(data)) {{
+                        if (data.length === 0) return '<div class="json-row">' + keyHtml + '<span style="color:#888">[]</span></div>';
+                        let html = '<details class="json-node" ' + openAttr + '><summary>' + keyHtml + 'Array [' + data.length + ']' + controlsHtml + '</summary><div class="json-children">';
+                        data.forEach((item, index) => {{
+                            html += renderJsonTree(item, depth + 1, String(index), true, false);
+                        }});
+                        html += '</div></details>';
+                        return html;
+                    }}
+
+                    if (typeof data === 'object') {{
+                        const keys = Object.keys(data);
+                        if (keys.length === 0) return '<div class="json-row">' + keyHtml + '<span style="color:#888">{{}}</span></div>';
+                        let html = '<details class="json-node" ' + openAttr + '><summary>' + keyHtml + 'Object {{' + keys.length + '}}' + controlsHtml + '</summary><div class="json-children">';
+                        keys.forEach(k => {{
+                            html += renderJsonTree(data[k], depth + 1, k, false, false);
+                        }});
+                        html += '</div></details>';
+                        return html;
+                    }}
+                    return '<div class="json-row">' + keyHtml + escapeHTML(String(data)) + '</div>';
+                }}
+                // --------------------------------
 
                 async function fetchLogs() {{
                     if (isFetching) return;
@@ -700,7 +851,7 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                             
                             for (let i = knownLogCount; i < history.length; i++) {{
                                 const log = history[i];
-                                rawLogData.push(log); // Save for copying
+                                rawLogData.push(log); // Always save raw text for pristine copying
                                 
                                 const isError = log.is_error ? 'error' : '';
                                 const isHuman = log.role === 'human' ? 'human' : '';
@@ -709,7 +860,6 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                                 const toolText = log.tool_name ? ` | Tool: ${{log.tool_name}}` : '';
                                 const nodeText = log.node_name ? `Node: ${{log.node_name}}` : `Role: ${{log.role}}`;
                                 
-                                // --- Sidebar Checkpoint Logic ---
                                 if (log.role === 'human') {{
                                     appendCheckpoint(i, 'human', 'Human Intervention', escapeHTML(log.content).substring(0, 40) + '...', log.timestamp);
                                 }} else if (log.is_error) {{
@@ -717,7 +867,6 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                                 }} else if (log.node_name === 'Manager' && log.role === 'ai_tool_call' && log.tool_name === 'RouteDecision') {{
                                     appendCheckpoint(i, 'manager', 'Manager Routing', escapeHTML(log.content).substring(0, 40) + '...', log.timestamp);
                                 }}
-                                // --------------------------------
                                 
                                 let tokenHtml = '';
                                 if (log.role === 'ai_prompt') {{
@@ -747,11 +896,17 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                                         </div>
                                         <div class="log-meta-right">
                                             ${{tokenHtml}}
-                                            <button class="copy-btn" onclick="copyText(this, ${{i}})">Copy</button>
-                                            <button class="toggle-btn" id="btn-${{i}}" onclick="toggleSingleCard(this, ${{i}})">▼ Expand</button>
+                                            <div class="dropdown">
+                                                <button class="copy-btn" id="copy-btn-${{i}}">Copy <span style="font-family: monospace; font-size: 1.1em; font-weight: bold; pointer-events: none;">▼</span></button>
+                                                <div class="dropdown-content">
+                                                    <button onclick="copyText(document.getElementById('copy-btn-${{i}}'), ${{i}}, false)">Copy All</button>
+                                                    <button onclick="copyText(document.getElementById('copy-btn-${{i}}'), ${{i}}, true)">Copy w/o Thoughts</button>
+                                                </div>
+                                            </div>
+                                            <button class="toggle-btn" id="btn-${{i}}" onclick="toggleSingleCard(this, ${{i}})"><span style="font-family: monospace; font-size: 1.1em; font-weight: bold; pointer-events: none;">▼</span> Expand</button>
                                         </div>
                                     </div>
-                                    <div class="log-content" id="content-${{i}}">${{escapeHTML(log.content)}}</div>
+                                    <div class="log-content" id="content-${{i}}">${{formatLogContent(log.content)}}</div>
                                 `;
                                 
                                 container.appendChild(card);
@@ -762,7 +917,7 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                                         card.classList.add('expandable');
                                         if (allExpanded) {{
                                             card.classList.add('expanded');
-                                            document.getElementById(`btn-${{i}}`).innerText = '▲ Collapse';
+                                            document.getElementById(`btn-${{i}}`).innerHTML = '<span style="font-family: monospace; font-size: 1.1em; font-weight: bold; pointer-events: none;">▲</span> Collapse';
                                         }}
                                     }}
                                 }}, 0);
@@ -772,7 +927,6 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
 
                             if (isAutoScrollEnabled) {{
                                 mainScrollArea.scrollTo(0, mainScrollArea.scrollHeight);
-                                // Auto scroll sidebar too
                                 const sidebarList = document.getElementById('sidebar-list');
                                 sidebarList.scrollTo(0, sidebarList.scrollHeight);
                             }}

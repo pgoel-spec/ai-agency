@@ -32,12 +32,13 @@ class BrainstormingOption(BaseModel):
     pros_and_cons: str = Field(..., description="Compare this against other options.")
 
 class WriteFileInput(BaseModel):
+    thought: str = Field(description="Your ReAct framework reasoning for why you are calling this tool right now.")
     context_analysis: str = Field(description="If building a feature, summarize the current state and requirements. If fixing a bug, explain the root cause.")
     # This is what forces the 'Tree of Thoughts' behavior.
     brainstorming: List[BrainstormingOption] = Field(
         ..., 
         min_items=3, 
-        description="Propose exactly 3 distinct technical approaches. Do not commit to one yet."
+        description="Internally brainstorm 3 distinct technical approaches to solve the problem before writing the code."
     )
     critique_and_selection: str = Field(description="Critique the pros, cons, and edge cases of each approach proposed above. Then, explicitly state which approach you are choosing and why it is the most robust.")
     implementation_plan: str = Field(description="Step-by-step strategy of how to execute the CHOSEN solution across the codebase.")
@@ -57,6 +58,7 @@ class ManageDevServerInput(BaseModel):
 class InspectFrontendInput(BaseModel):
     thought: str = Field(description="Explain what you expect to see or test by inspecting the frontend.")
     url: str = Field(description="The local URL to inspect, e.g. http://localhost:5000")
+    wait_for_selector: str = Field(description="Optional. A specific CSS selector to wait for before inspecting the console (e.g., '.news-item'). Use this if your code fetches data asynchronously.", default="")
 
 # Add this schema near your other Input schemas at the top of the file
 class WebSearchInput(BaseModel):
@@ -312,7 +314,7 @@ def read_file(thought: str, file_path: str, config: RunnableConfig) -> str:
         return f"Error reading file: {str(e)}"
 
 @tool(args_schema=WriteFileInput)
-def write_file(context_analysis: str, brainstorming: list, critique_and_selection: str, implementation_plan: str, files: list, config: RunnableConfig) -> str:
+def write_file(thought: str, context_analysis: str, brainstorming: list, critique_and_selection: str, implementation_plan: str, files: list, config: RunnableConfig) -> str:
     """Creates multiple files (or overwrites existing) inside the workspace simultaneously. Use this to keep frontend and backend logic in sync in a single turn."""
     workspace = config.get("configurable", {}).get("sandbox")
     if not workspace:
@@ -328,6 +330,7 @@ def write_file(context_analysis: str, brainstorming: list, critique_and_selectio
     
     # Log the AI's entire cognitive process internally
     cognitive_log = (
+        f"REACT THOUGHT: {thought}\n"
         f"ANALYSIS: {context_analysis}\n"
         f"BRAINSTORMING PATHS:\n{brainstorming_text}\n"
         f"CRITIQUE: {critique_and_selection}\n"
@@ -525,7 +528,7 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
         else:
             return f"Git push succeeded, but PR creation failed: {pr_resp.text}"
 
-tool
+#@tool #Uncomment this later, as of now, I dont want save changes until the tool starts working better
 def sync_wip_commit(thought: str, commit_message: str, config: RunnableConfig) -> str:
     """
     Saves your current progress to a temporary remote WIP branch so it is not lost if the server crashes.
@@ -634,17 +637,36 @@ def manage_dev_server(thought: str, action: str, command: str, config: RunnableC
             for _ in range(max_wait_time // 2):
                 time.sleep(2) # Pause the Python thread, delaying the LLM's next turn
                 
+                # 1. LOGICAL LIVENESS CHECK: Did the background process die unexpectedly?
+                is_alive_check = workspace.commands.run(f"kill -0 $(cat {pid_file} 2>/dev/null) 2>/dev/null")
+                if is_alive_check.exit_code != 0:
+                    break # Process crashed, break immediately to report the error
+
                 # Read the current state of the logs from E2B
                 current_logs_result = workspace.commands.run(f"tail -n 50 {log_file}")
                 current_logs = current_logs_result.stdout or ""
                 
-                # Check for Firebase success/failure signatures
-                if "All emulators ready" in current_logs or "listening on port" in current_logs:
-                    booted = True
-                    break
+                # 2. FAILURE CHECK: Catch crash signatures in the logs
                 if any(err in current_logs for err in ["Failed to start", "port taken", "Error:", "No such file", "command not found"]):
-                    break # Boot failed, break early to show the agent the error
+                    break # Boot failed, break early
+                
+                # 3. LOGICAL NETWORK VERIFICATION: Verify the port is actually bound
+                if "All emulators ready" in current_logs or "listening on port" in current_logs:
+                    # Dynamically find the port the AI defined in the logs or fallback to a standard port
+                    # Use netcat (nc) to perform a TCP ping. -z means zero-I/O (just scan), -w 1 is a 1-second timeout
+                    tcp_check = workspace.commands.run(
+                        "PORT=$(grep -oP '(?<=port )[0-9]+|(?<=:)[0-9]{4}' /tmp/server_logs.txt | tail -n 1); "
+                        "if [ -z \"$PORT\" ]; then PORT=5000; fi; "
+                        "nc -z -w 1 localhost $PORT"
+                    )
                     
+                    if tcp_check.exit_code == 0:
+                        booted = True # The port is actively accepting connections!
+                        break
+                    
+                    # NOTE: If the log says "listening" but netcat fails, we intentionally DO NOT break. 
+                    # The loop will naturally continue to the next 2-second tick and try again.
+
             # Fetch final logs to return to the agent immediately
             final_logs = workspace.commands.run(f"tail -n 50 {log_file}").stdout
             
@@ -704,7 +726,7 @@ def manage_dev_server(thought: str, action: str, command: str, config: RunnableC
     return "Invalid action."
 
 @tool(args_schema=InspectFrontendInput)
-def inspect_frontend(thought: str, url: str, config: RunnableConfig) -> str:
+def inspect_frontend(thought: str, url: str, config: RunnableConfig, wait_for_selector: str = "") -> str:
     """Opens a headless browser, navigates to the URL, and returns console errors and network failures."""
     workspace = config.get("configurable", {}).get("sandbox")
     if not workspace:
@@ -724,7 +746,19 @@ def inspect_frontend(thought: str, url: str, config: RunnableConfig) -> str:
             }});
             page.on('pageerror', err => errors.push(`[PAGE CRASH] ${{err.message}}`));
             
-            await page.goto('{url}', {{ waitUntil: 'networkidle', timeout: 15000 }});
+            await page.goto('{url}', {{ waitUntil: 'domcontentloaded', timeout: 15000 }});
+            
+            // Deterministic Logic: Wait for the exact DOM element the AI expects
+            if ('{wait_for_selector}') {{
+                try {{
+                    await page.waitForSelector('{wait_for_selector}', {{ state: 'attached', timeout: 10000 }});
+                }} catch (e) {{
+                    errors.push(`[TIMEOUT] Expected element '{wait_for_selector}' never appeared. Async data may have failed.`);
+                }}
+            }} else {{
+                // Logical fallback if no selector is provided
+                await page.waitForLoadState('networkidle', {{ timeout: 5000 }}).catch(() => {{}});
+            }}
             
             console.log("=== BROWSER DIAGNOSTICS ===");
             console.log(errors.length ? errors.join('\\n') : "SUCCESS: No console errors detected.");

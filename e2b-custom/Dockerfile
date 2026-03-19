@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     psmisc \
+    netcat-openbsd \
     libnspr4 \
     libnss3 \
     libxss1 \
