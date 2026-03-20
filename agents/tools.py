@@ -19,30 +19,25 @@ class TerminalInput(BaseModel):
 
 class ReadFileInput(BaseModel):
     thought: str = Field(description="Explain WHY you are reading this file. If you already ran generate_repo_map, explain why that output was insufficient.")
-    file_path: str = Field(description="Path to the file to read")
-
-class FileWriteDefinition(BaseModel):
-    file_path: str = Field(..., description="Path to the file to be written.")
-    content: str = Field(..., description="The full content of the file.")
-
-# --- Helper for Structured Thinking ---
-class BrainstormingOption(BaseModel):
-    approach_name: str = Field(..., description="Short name (e.g., 'Express Route Change')")
-    logic: str = Field(..., description="Technical breakdown of the implementation.")
-    pros_and_cons: str = Field(..., description="Compare this against other options.")
+    file_path: str = Field(description="The ABSOLUTE path to the file to read")
 
 class WriteFileInput(BaseModel):
-    thought: str = Field(description="Your ReAct framework reasoning for why you are calling this tool right now.")
-    context_analysis: str = Field(description="If building a feature, summarize the current state and requirements. If fixing a bug, explain the root cause.")
-    # This is what forces the 'Tree of Thoughts' behavior.
-    brainstorming: List[BrainstormingOption] = Field(
+    chain_of_thought: str = Field(
         ..., 
-        min_items=3, 
-        description="Internally brainstorm 3 distinct technical approaches to solve the problem before writing the code."
+        description=(
+            "A multi-layered recursive analysis: "
+            "1. Core Logic: The technical approach for this change. "
+            "2. Thought behind the Thought: Why this is the most robust path. "
+            "3. Risk Audit: Potential side effects or breaking changes. "
+            "4. Verification Plan: How you will prove this works in the sandbox."
+        )
     )
-    critique_and_selection: str = Field(description="Critique the pros, cons, and edge cases of each approach proposed above. Then, explicitly state which approach you are choosing and why it is the most robust.")
-    implementation_plan: str = Field(description="Step-by-step strategy of how to execute the CHOSEN solution across the codebase.")
-    files: List[FileWriteDefinition] = Field(description="A list of files to create or edit. Work on frontend and backend files simultaneously.")
+    # No deeply nested Pydantic models. Using 'files' as a list[dict] rather than 
+    # a Pydantic object to prevent Gemini from hallucinating nested schema titles.
+    files: list[dict] = Field(
+        ..., 
+        description="A list of files to create or edit. MUST be a list of dictionaries, each containing exactly two keys: 'file_path' (The ABSOLUTE path) and 'content'."
+    )
 
 class GitHubPRInput(BaseModel):
     ticket_id: str = Field(description="Linear ticket ID")
@@ -67,7 +62,7 @@ class WebSearchInput(BaseModel):
 
 class GenerateRepoMapInput(BaseModel):
     thought: str = Field(description="Confirm that you are mapping the repo to understand the architecture before writing code.")
-    target_dir: str = Field(description="The root directory to map. You MUST pass exactly '/home/user' as the value.")
+    target_dir: str = Field(description="The directory to map. Leave as '.' to use the default repository.")
 
 def _parse_github_time(ts_str: str) -> datetime:
     """Safely converts a GitHub ISO 8601 string to a datetime object."""
@@ -247,17 +242,17 @@ def run_terminal_command(thought: str, command: str, config: RunnableConfig) -> 
         "npm install", "npm i", "yarn add", "yarn install", 
         "pnpm install", "pnpm i", "pip install", "poetry install"
     ]
+
+    # Grab the globally stored repo path
+    repo_root = config.get("configurable", {}).get("repo_root", ".")
     
     if any(keyword in command.lower() for keyword in install_keywords):
-        # Dynamically locate the true git root directory, then safely append standard ignores 
-        # and remove duplicates (using sort -u) without interrupting the actual command.
+        # Safely append standard ignores and remove duplicates (using sort -u) without interrupting the actual command.
         gitignore_safeguard = (
-            "GIT_DIR=$(find /home/user -maxdepth 3 -type d -name '.git' | head -n 1); "
-            "if [ -n \"$GIT_DIR\" ]; then "
-            "  REPO_ROOT=$(dirname \"$GIT_DIR\"); "
-            "  echo -e 'node_modules/\\nvenv/\\n.venv/\\n__pycache__/\\n*.pyc\\n.env\\n.next/\\nbuild/\\ndist/' >> \"$REPO_ROOT/.gitignore\"; "
-            "  sort -u \"$REPO_ROOT/.gitignore\" -o \"$REPO_ROOT/.gitignore\"; "
-            "fi;"
+            f"if [ -d \"{repo_root}\" ]; then "
+            f"  echo -e 'node_modules/\\nvenv/\\n.venv/\\n__pycache__/\\n*.pyc\\n.env\\n.next/\\nbuild/\\ndist/' >> \"{repo_root}/.gitignore\"; "
+            f"  sort -u \"{repo_root}/.gitignore\" -o \"{repo_root}/.gitignore\"; "
+            f"fi;"
         )
         command = f"{command}\n{gitignore_safeguard}"
     
@@ -275,11 +270,14 @@ def run_terminal_command(thought: str, command: str, config: RunnableConfig) -> 
         "GITHUB_REPO": github_repo,
         **client_secrets
     }
+    
+    # Auto-navigate before running the AI's command
+    full_command = f"cd '{repo_root}' && {command}"
 
     try:
         # We execute the modified command string in the E2B sandbox
         execution = workspace.commands.run(
-            command,
+            full_command,
             envs=tool_envs,
             timeout=120
         )
@@ -308,43 +306,38 @@ def read_file(thought: str, file_path: str, config: RunnableConfig) -> str:
     if not workspace:
         return "Error: No active sandbox found in configuration."
 
+    # If the AI uses a relative path, force it inside the actual git repository
+    if not file_path.startswith("/"):
+        repo_root = config.get("configurable", {}).get("repo_root", ".")
+        file_path = os.path.join(repo_root, file_path)
+
     try:
         return workspace.files.read(file_path)
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
 @tool(args_schema=WriteFileInput)
-def write_file(thought: str, context_analysis: str, brainstorming: list, critique_and_selection: str, implementation_plan: str, files: list, config: RunnableConfig) -> str:
+def write_file(chain_of_thought: str, files: list, config: RunnableConfig) -> str:
     """Creates multiple files (or overwrites existing) inside the workspace simultaneously. Use this to keep frontend and backend logic in sync in a single turn."""
     workspace = config.get("configurable", {}).get("sandbox")
     if not workspace:
         return "Error: No active sandbox found in configuration."
 
-    results = []
+    repo_root = config.get("configurable", {}).get("repo_root", ".")
 
-    # Format the structured brainstorming list into a readable string for the logs
-    brainstorming_text = "\n".join([
-        f"- {option.approach_name}: {option.logic} (Pros/Cons: {option.pros_and_cons})" 
-        for option in brainstorming
-    ])
-    
-    # Log the AI's entire cognitive process internally
-    cognitive_log = (
-        f"REACT THOUGHT: {thought}\n"
-        f"ANALYSIS: {context_analysis}\n"
-        f"BRAINSTORMING PATHS:\n{brainstorming_text}\n"
-        f"CRITIQUE: {critique_and_selection}\n"
-        f"PLAN: {implementation_plan}\n"
-    )
-    results.append(cognitive_log)
+    results = [f"CHAIN OF THOUGHT: {chain_of_thought}\n"] # Refined internal log
     
     for f in files:
-        file_path = f.file_path
-        content = f.content
+        file_path = f.get("file_path")
+        content = f.get("content")
         
         if not file_path or not content:
             results.append(f"Error: Missing file_path or content in one of the file objects.")
             continue
+
+        # If the AI uses a relative path, force it inside the actual git repository
+        if not file_path.startswith("/"):
+            file_path = os.path.join(repo_root, file_path)
             
         try:
             workspace.files.write(file_path, content)
@@ -425,6 +418,7 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
     }
 
     repo_folder = repo_full.split("/")[-1].replace(".git", "")
+    repo_root = config.get("configurable", {}).get("repo_root", ".")
 
     # This calls the same function that main.py uses to check for PRs
     existing_pr = get_latest_pr(ticket_id, github_token=github_token, repo_full=repo_full)
@@ -437,15 +431,7 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
 
         # We push the current working state (HEAD) directly to the PR branch.
         git_commands = f"""
-        GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
-        if [ -z "$GIT_DIR" ]; then 
-            echo "Empty sandbox detected. Cloning fresh copy..."
-            cd /home/user
-            git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git
-            GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
-            if [ -z "$GIT_DIR" ]; then exit 1; fi
-        fi
-        cd "$(dirname "$GIT_DIR")"
+        cd '{repo_root}'
         
         # Ensure we are on the exact WIP branch before executing PR logic
         git fetch origin
@@ -475,15 +461,7 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
         tool_envs["COMMIT_MSG"] = commit_message
 
         git_commands = f"""
-        GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
-        if [ -z "$GIT_DIR" ]; then 
-            echo "Empty sandbox detected. Cloning fresh copy..."
-            cd /home/user
-            git clone https://$GITHUB_TOKEN@github.com/$GITHUB_REPO.git
-            GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
-            if [ -z "$GIT_DIR" ]; then exit 1; fi
-        fi
-        cd "$(dirname "$GIT_DIR")"
+        cd '{repo_root}'
         
         # Ensure we are on the exact WIP branch before executing PR logic
         git fetch origin
@@ -549,16 +527,13 @@ def sync_wip_commit(thought: str, commit_message: str, config: RunnableConfig) -
 
     # Extract repo folder
     repo_folder = repo_full.split("/")[-1].replace(".git", "")
+    
+    repo_root = config.get("configurable", {}).get("repo_root", ".")
 
     # The script uses HEAD:refs/heads/... to push the current state to the remote WIP branch
     # without altering the agent's current local branch checkout.
     git_commands = f"""
-    GIT_DIR=$(find /home/user -maxdepth 3 -type d -name ".git" | head -n 1)
-    if [ -z "$GIT_DIR" ]; then
-        echo "Error: No git repository found in the workspace. Did you clone it?"
-        exit 1
-    fi
-    cd "$(dirname "$GIT_DIR")"
+    cd '{repo_root}'
     
     git config --global user.email "ai@agency.dev"
     git config --global user.name "AI Developer"
@@ -611,7 +586,8 @@ def manage_dev_server(thought: str, action: str, command: str, config: RunnableC
             workspace.files.write(log_file, "=== SERVER INITIALIZING IN BACKGROUND ===\nWait at least 20s for logs to appear...\n")
 
             # Intelligently find the directory containing firebase.json
-            cd_cmd = "cd $(find /home/user -maxdepth 3 -name firebase.json -printf '%h\\n' | head -n 1) || cd /home/user/public-ledger"
+            repo_root = config.get("configurable", {}).get("repo_root", ".")
+            cd_cmd = f"cd $(find '{repo_root}' -maxdepth 3 -name firebase.json -printf '%h\\n' | head -n 1) || cd '{repo_root}'"
             
             # Native E2B background execution.
             # We must manually redirect stdout/stderr to a file within the command if we want to read the logs later.
@@ -685,6 +661,8 @@ def manage_dev_server(thought: str, action: str, command: str, config: RunnableC
         return f"Server Logs:\n{res.stdout or res.stderr}"
         
     elif action == "stop":
+        repo_root = config.get("configurable", {}).get("repo_root", ".")
+
         cleanup_cmd = f"""
         echo "Stopping parent process recorded in {pid_file}..."
         PID=$(cat {pid_file} || echo "")
@@ -696,7 +674,7 @@ def manage_dev_server(thought: str, action: str, command: str, config: RunnableC
         PORTS="4000 4400 4500 5000 5001 8080 8081 8085 9000 9099 9199"
         
         # 2. Intelligently extract ANY custom ports the AI configured in firebase.json
-        FIREBASE_JSON=$(find /home/user -maxdepth 3 -name firebase.json -print -quit)
+        FIREBASE_JSON=$(find '{repo_root}' -maxdepth 3 -name firebase.json -print -quit)
         if [ ! -z "$FIREBASE_JSON" ]; then
             # Uses grep to find all port numbers defined in the JSON
             CUSTOM_PORTS=$(grep -o '"port": *[0-9]*' "$FIREBASE_JSON" | grep -o '[0-9]*')
@@ -746,19 +724,33 @@ def inspect_frontend(thought: str, url: str, config: RunnableConfig, wait_for_se
             }});
             page.on('pageerror', err => errors.push(`[PAGE CRASH] ${{err.message}}`));
             
+            // Hijack setTimeout to force all delays to 0ms in the test environment
+            await page.addInitScript(() => {{
+                const originalSetTimeout = window.setTimeout;
+                window.setTimeout = function(callback, delay, ...args) {{
+                    return originalSetTimeout(callback, 0, ...args); // Overrides any delay
+                }};
+            }});
+
             await page.goto('{url}', {{ waitUntil: 'domcontentloaded', timeout: 15000 }});
             
+            // ALWAYS wait for the network to go idle so async fetch() calls finish!
+            await page.waitForLoadState('networkidle', {{ timeout: 10000 }}).catch(() => {{}});
+
+            // Check the AI's selector AFTER the network has settled
             // Deterministic Logic: Wait for the exact DOM element the AI expects
             if ('{wait_for_selector}') {{
                 try {{
-                    await page.waitForSelector('{wait_for_selector}', {{ state: 'attached', timeout: 10000 }});
+                    // Reduced timeout since the network is already done loading
+                    await page.waitForSelector('{wait_for_selector}', {{ state: 'attached', timeout: 5000 }});
                 }} catch (e) {{
                     errors.push(`[TIMEOUT] Expected element '{wait_for_selector}' never appeared. Async data may have failed.`);
                 }}
-            }} else {{
-                // Logical fallback if no selector is provided
-                await page.waitForLoadState('networkidle', {{ timeout: 5000 }}).catch(() => {{}});
             }}
+
+            // Add a tiny 500ms safety buffer for React/VanillaJS to render DOM updates 
+            // and throw console errors AFTER the fetch payload arrives.
+            await page.waitForTimeout(500);
             
             console.log("=== BROWSER DIAGNOSTICS ===");
             console.log(errors.length ? errors.join('\\n') : "SUCCESS: No console errors detected.");
@@ -768,10 +760,10 @@ def inspect_frontend(thought: str, url: str, config: RunnableConfig, wait_for_se
         }}
     }})();
     """
-    workspace.files.write("/home/user/inspect.js", script)
+    workspace.files.write("/tmp/inspect.js", script)
     
     # Explicitly tell Playwright exactly where we stored the browsers in the Docker image
-    cmd = "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright NODE_PATH=$(npm root -g) node /home/user/inspect.js"
+    cmd = "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright NODE_PATH=$(npm root -g) node /tmp/inspect.js"
     res = workspace.commands.run(cmd)
     
     return res.stdout or res.stderr
@@ -823,7 +815,8 @@ def generate_repo_map(thought: str, target_dir: str, config: RunnableConfig) -> 
             
             level = dirpath.replace(root_dir, '').count(os.sep)
             indent = ' ' * 4 * level
-            tree_str += f"{indent}{os.path.basename(dirpath)}/\\n"
+            # Print the absolute path of the directory
+            tree_str += f"{indent}{dirpath}/\\n"
             
             subindent = ' ' * 4 * (level + 1)
             for f in filenames:
@@ -842,8 +835,7 @@ def generate_repo_map(thought: str, target_dir: str, config: RunnableConfig) -> 
                             content = content[:30000] + "\\n\\n... [TRUNCATED DUE TO SIZE] ..."
                         
                         # Add to content output
-                        relative_path = filepath.replace(root_dir + '/', '')
-                        content_str += f"\\n--- FILE: {relative_path} ---\\n"
+                        content_str += f"\\n--- FILE: {filepath} ---\\n"
                         content_str += f"{content}\\n"
                 except Exception:
                     pass # Skip unreadable or binary files
@@ -851,21 +843,32 @@ def generate_repo_map(thought: str, target_dir: str, config: RunnableConfig) -> 
         return tree_str + content_str
 
     if __name__ == "__main__":
-        # Dynamically find the cloned git repository
-        cmd = "find /home/user -maxdepth 3 -type d -name '.git' | head -n 1"
-        git_dir = os.popen(cmd).read().strip()
+        import sys
+        import os
         
-        if git_dir:
-            repo_root = os.path.dirname(git_dir)
-            print(generate_map(repo_root))
+        # Accept the path passed from the LangGraph config
+        target = sys.argv[1] if len(sys.argv) > 1 else "."
+        
+        if os.path.exists(os.path.join(target, ".git")):
+            print(generate_map(target))
         else:
-            print("Error: No git repository found. You must clone the repository first.")
+            print(f"Error: No git repository found at {target}. You must clone the repository first.")
     """)
     
     try:
-        # Write the script to the sandbox and execute it
-        workspace.files.write("/home/user/ingest_repo.py", ingest_script)
-        res = workspace.commands.run("python3 /home/user/ingest_repo.py")
+        repo_root = config.get("configurable", {}).get("repo_root", ".")
+        
+        # Calculate the exact path the AI wants to map
+        if target_dir == "." or not target_dir:
+            actual_target = repo_root
+        elif not target_dir.startswith("/"):
+            actual_target = os.path.join(repo_root, target_dir)
+        else:
+            actual_target = target_dir
+
+        # Write the script to the sandbox and execute it against the actual_target
+        workspace.files.write("/tmp/ingest_repo.py", ingest_script)
+        res = workspace.commands.run(f"python3 /tmp/ingest_repo.py '{actual_target}'")
         
         output = res.stdout or res.stderr
         return output if output else "Repository map generated, but it was empty."

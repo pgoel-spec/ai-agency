@@ -2,7 +2,6 @@ import os
 import json
 import copy
 from pydantic import BaseModel, Field
-from langchain_google_vertexai import ChatVertexAI
 from langchain_google_vertexai.model_garden import ChatAnthropicVertex
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
@@ -86,27 +85,33 @@ devops_tools = [DevOpsReport, create_github_pr]
 project_id = os.environ.get("PROJECT_ID")
 
 # Configuration common to all agents to ensure structured output
-json_config = {
+base_config = {
     # "model_kwargs": {"response_mime_type": "application/json"},
     "project": project_id,
     "max_retries": 2,
     "vertexai": True,
-    "max_output_tokens": 8192
+    "max_output_tokens": 8192,
 }
+
+# Manager keeps the default temperature (1.0) for high-level strategy
+manager_config = {**base_config, "temperature": 1.0}
+
+# Workers use 0.1 for deterministic, precise code generation
+worker_config = {**base_config, "temperature": 0.1}
 
 manager_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-pro", # Recommended version for stable JSON
-    **json_config
-).bind_tools([RouteDecision, update_linear_ticket])
+    **manager_config
+).bind_tools(manager_tools)
 
 devops_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-pro",
-    **json_config
+    **worker_config
 ).bind_tools(devops_tools)
 
 developer_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-pro",
-    **json_config
+    **worker_config
 ).bind_tools(developer_tools)
 
 """ developer_llm = ChatAnthropicVertex(
@@ -674,13 +679,14 @@ def developer_node(state: AgencyState) -> dict:
         "- Architecture Ingestion: Use `generate_repo_map` as your mandatory first step to map the entire directory tree and file contents.\n"
         "- Exploration & Implementation: generate_repo_map already places file contents in your memory. Do NOT use read_file unless the file has been modified since the map was generated. Use `write_file` to execute your implementation plan across multiple files simultaneously.\n"
         "- Server Management: Use `manage_dev_server` to safely start, monitor logs, and stop background processes (e.g., dev servers, emulators) without causing timeouts.\n"
-        "- Observation & Verification: Use `inspect_frontend` to test live URLs for browser console errors, and `run_terminal_command` for short-lived unit tests or scripts.\n"
+        #"- Internal Logic Verification: Use the native code_execution tool to verify pure Python logic, algorithms, or data transformations in a secure, managed environment.\n"
+        "- System Observation & Verification: Use `inspect_frontend` to test live URLs for browser console errors, and `run_terminal_command` for shell scripts, unit tests, or interactions with the project files.\n"
         "- Research & Debugging: Use `web_search` to look up framework documentation or solutions to persistent errors before guessing.\n"
         "- Backup/Saving: Use `sync_wip_commit` to save your progress remotely after major changes.\n"
         "- Progress Reporting: Use `ReportStatus` to yield control back to the Manager when you finish a chunk of work, hit a blocker, or complete the feature.\n\n"
 
         "YOUR INSTRUCTIONS:\n"
-        "1. Work through the process step-by-step. ALWAYS begin your turn by writing a brief, standard text response summarizing your current state or acknowledging the previous tool's success/failure. NEVER return an empty text response. After your text summary, you may call a tool. After every tool call, analyze the output before deciding your next move. The ReAct Framework is enforced: EVERY tool requires a `thought` parameter. You MUST use this parameter to explain your exact logical reasoning before the tool executes. E.g., If you are about to use `read_file`, use the `thought` parameter to check your memory first to see if you already know the file contents from `generate_repo_map`.\n"
+        "1. Work through the process step-by-step. ALWAYS begin your turn by writing a brief, standard text response summarizing your current state or acknowledging the previous tool's success/failure. NEVER return an empty text response. After your text summary, you may call a tool. After every tool call, analyze the output before deciding your next move. The ReAct Framework is enforced: EVERY tool requires a 'thought' parameter (or 'chain_of_thought' for `write_file`). You MUST use this parameter to explain your exact logical reasoning before the tool executes. E.g., If you are about to use `read_file`, use the `thought` parameter to check your memory first to see if you already know the file contents from `generate_repo_map`.\n"
         #"2. Parallel Tool Calling: You can call `write_file` and immediately call `sync_wip_commit` in the exact same response to save time.\n"
         #"1. Work through the process intelligently. You are encouraged to BATCH multiple tool calls in a single turn whenever possible to save time. For example, you can call `write_file` and immediately call `sync_wip_commit` in the exact same response.\n"
         "2. Initialization & Discovery:\n"
@@ -751,15 +757,15 @@ def developer_node(state: AgencyState) -> dict:
         "4. THE H-R-A-O LOOP: When fixing a bug or using an unfamiliar framework, you MUST follow this loop:\n"
         "   - Hypothesis: State what you think is wrong.\n"
         "   - Research (CRITICAL): If you encounter a persistent error (like a 404, compilation failure, or missing dependency) DO NOT GUESS. You MUST use the `web_search` tool to search for the specific error message or framework documentation (e.g., 'Firebase Express rewrite 404').\n"
-        "   - Action: Use `write_file` or `run_terminal_command` to implement the researched solution. You MUST edit both the frontend caller and backend receiver files in the EXACT SAME `write_file` call to prevent intermediate broken states.\n"
+        "   - Action: Use write_file, run_terminal_command to implement and verify the researched solution. You MUST edit both the frontend caller and backend receiver files in the EXACT SAME `write_file` call to prevent intermediate broken states.\n"
         "   - Observation: You MUST test the code via `manage_dev_server` or `inspect_frontend` to observe if it worked before declaring the task COMPLETE.\n"
         "5. AVOID HALLUCINATION: Frameworks update constantly. If you are unsure how a specific configuration file (like firebase.json, next.config.js, or Dockerfiles) handles routing or ports, use the `web_search` tool before writing code.\n"
-        "6. SERVER MANAGEMENT, WAITING & PATHING: Never use `run_terminal_command` to start a web server (it will cause a timeout). You MUST use the `manage_dev_server` tool to start/stop servers in the background (e.g., `manage_dev_server(action='start', command='npx firebase emulators:start')`). IMPORTANT PATHING RULE: `manage_dev_server` automatically finds and navigates to your project root (e.g., where firebase.json is) before executing. DO NOT prepend `cd` to your server commands (e.g., use `command='npx firebase emulators:start'`, NEVER `command='cd public-ledger && npx...'`). Only use `cd` when calling `run_terminal_command` for specific directory-level scripts. IMPORTANT WAITING RULE: The tool will automatically pause and wait for the server to boot before returning the initial logs to you. You do not need to wait multiple turns. If the boot was successful, you can immediately test the port or call `inspect_frontend` in your very next turn.\n"
-        "7. OBSERVATION TOOLS: To complete your HAO loop, you must observe results via `manage_dev_server(action='logs')` or `inspect_frontend(url='http://localhost:5000')`. Always attempt to verify your code on the live server first.\n"
+        "6. SERVER MANAGEMENT, WAITING & PATHING: Never use `run_terminal_command` to start a web server (it will cause a timeout). You MUST use the `manage_dev_server` tool to start/stop servers in the background (e.g., `manage_dev_server(action='start', command='npx firebase emulators:start')`). IMPORTANT PATHING RULE: All terminal and server tools automatically find and navigate to the git repository root before executing. DO NOT prepend cd to ANY of your commands (e.g., use command='npm install', NEVER command='cd repo-name && npm install'). IMPORTANT WAITING RULE: The tool will automatically pause and wait for the server to boot before returning the initial logs to you. You do not need to wait multiple turns. If the boot was successful, you can immediately test the port or call `inspect_frontend` in your very next turn.\n"
+        "7. OBSERVATION TOOLS: To complete your HAO loop, you must observe results via `manage_dev_server(action='logs')` or `inspect_frontend(url='http://localhost:5000')`. When using inspect_frontend, you MUST ALWAYS provide a wait_for_selector (e.g., wait_for_selector='.news-feed article'). The wait_for_selector MUST be an element that only renders after the async API call completes. This guarantees the testing browser waits for your asynchronous API data to render before closing. Always attempt to verify your code on the live server first.\n"
         "8. UNIT TESTING PIVOT (FALLBACK): If local ports fail to bind, `manage_dev_server` continues to return empty logs or errors, OR `curl` results in 'connection refused':\n"
         "   - ABANDON live server testing immediately. Do not attempt `inspect_frontend` again.\n"
         "   - Use `write_file` to create isolated unit test files (e.g., `jest`, `pytest`, or a simple `test_logic.js` script that directly imports your backend functions/logic).\n"
-        "   - Run these unit tests directly via `run_terminal_command(command='node test_logic.js')` to verify your logic without booting a network server.\n"
+        "   - Run these unit tests directly via run_terminal_command(for Node.js) to verify your logic without booting a network server.\n"
         "   - Prove your code works via this unit test output to satisfy your Observation and bypass the Verification Gate.\n"
         
         # "RULES FOR TESTING:\n"

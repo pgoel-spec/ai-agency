@@ -100,13 +100,22 @@ def process_ticket(ticket_id: str, human_input: str, tenant_config: dict):
     if github_token and github_repo:
         setup_cmd = f"git clone https://{github_token}@github.com/{github_repo}.git"
         workspace.commands.run(setup_cmd)
+    
+    # The "Store at Boot" Strategy
+    # Dynamically find where the repo was just cloned (works regardless of Dockerfile WORKDIR)
+    default_dir_exec = workspace.commands.run("pwd")
+    default_dir = default_dir_exec.stdout.strip() if default_dir_exec.stdout else "/"
+    
+    repo_root_exec = workspace.commands.run(f"find '{default_dir}' -maxdepth 3 -type d -name '.git' | head -n 1 | xargs dirname")
+    repo_root = repo_root_exec.stdout.strip() if repo_root_exec.stdout else default_dir
     # -------------------------------------
 
     config = {
         "configurable": {
             "thread_id": ticket_id,
-            "sandbox": workspace, # Pass the sandbox here, NOT in the state!
-            "tenant_config": tenant_config
+            "sandbox": workspace, # Pass the sandbox here, NOT in the state
+            "tenant_config": tenant_config,
+            "repo_root": repo_root # Inject the global absolute path here
         }
     }
 

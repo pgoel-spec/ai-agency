@@ -28,7 +28,7 @@ def manager_brain_router(state: AgencyState):
 
     # Failsafe: If the LLM just returned text without calling any tools, 
     # force it back to itself to try again, or default to finish to prevent a crash.
-    return "FINISH"
+    return "Manager"
 
 def manager_tools_router(state: AgencyState):
     """
@@ -136,7 +136,7 @@ workflow.add_edge(START, "Manager")
 workflow.add_conditional_edges(
     "Manager", 
     manager_brain_router,
-    {"ManagerTools": "ManagerTools", "FINISH": END}
+    {"ManagerTools": "ManagerTools", "Manager": "Manager", "FINISH": END}
 )
 workflow.add_conditional_edges(
     "ManagerTools",
