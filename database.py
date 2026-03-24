@@ -1,8 +1,11 @@
-import sqlite3
 import json
+import sqlite3
 from contextlib import contextmanager
+from datetime import datetime
+from typing import Any
 
-DB_PATH = "agency_logs.db"
+AGENCY_DB_PATH = "agency_logs.db"
+PIPELINE_DB_PATH = "pipeline.db"
 
 @contextmanager
 def get_db_conn():
@@ -11,7 +14,7 @@ def get_db_conn():
     and securely closes the connection when finished to prevent memory leaks.
     """
     # timeout=10 is vital for SQLite when using FastAPI BackgroundTasks
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(AGENCY_DB_PATH, timeout=10)
     try:
         # The inner 'with' manages the transaction (commit/rollback)
         with conn:
@@ -22,10 +25,14 @@ def get_db_conn():
 
 def init_db():
     with get_db_conn() as conn:
+        # Enable concurrent reads and writes
+        conn.execute('PRAGMA journal_mode=WAL;')
+
         conn.execute('''
             CREATE TABLE IF NOT EXISTS activity_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticket_id TEXT,
+                project_id TEXT,
                 session_id TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 role TEXT,        -- 'human', 'ai', or 'tool'
@@ -36,17 +43,25 @@ def init_db():
                 input_tokens INTEGER DEFAULT 0
             )
         ''')
-        # Safely migrate existing databases by attempting to add the column
+
+        # Safely migrate existing databases by attempting to add new columns
+        # Each gets its own try/except so one failure doesn't block the others
+        try:
+            conn.execute("ALTER TABLE activity_logs ADD COLUMN project_id TEXT")
+        except sqlite3.OperationalError:
+            pass # Column already exists, safe to ignore
+            
         try:
             conn.execute('ALTER TABLE activity_logs ADD COLUMN session_id TEXT')
         except sqlite3.OperationalError:
-            pass # Column already exists, safe to ignore
+            pass 
+            
         try:
             conn.execute('ALTER TABLE activity_logs ADD COLUMN input_tokens INTEGER DEFAULT 0')
         except sqlite3.OperationalError:
             pass
 
-def log_activity(ticket_id, role, content, node_name=None, tool_name=None, is_error=False, session_id=None, input_tokens=0):
+def log_activity(ticket_id: str, role: str, content: Any, node_name: str = None, tool_name: str = None, is_error: bool = False, session_id: str = None, project_id: str = None, input_tokens: int = 0):
     """Saves a single event to the database with serialization."""
     try:
         # Serialization
@@ -64,11 +79,12 @@ def log_activity(ticket_id, role, content, node_name=None, tool_name=None, is_er
             # If it's already a string, boolean, etc.
             content_str = str(content)
         
+        # Inserts a new log entry into the database
         with get_db_conn() as conn:
             conn.execute('''
-                INSERT INTO activity_logs (ticket_id, session_id, role, node_name, content, tool_name, is_error, input_tokens)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (ticket_id, session_id, role, node_name, content_str, tool_name, is_error, input_tokens))
+                INSERT INTO activity_logs (ticket_id, project_id, session_id, role, node_name, content, tool_name, is_error, input_tokens)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (ticket_id, project_id, session_id, role, node_name, content_str, tool_name, is_error, input_tokens))
 
     except Exception as e:
         # If the actual database insert fails, print it prominently
@@ -114,4 +130,62 @@ def get_all_sessions():
             GROUP BY ticket_id, session_id
             ORDER BY last_active DESC
         ''')
+        return [dict(row) for row in cursor.fetchall()]
+
+def init_pipeline_db():
+    """Initializes the persistent task queue database."""
+    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY,
+                project_id TEXT,
+                status TEXT,
+                human_input TEXT,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+def get_active_tasks(project_id: str):
+    """Fetches all tasks that are currently Pending, Running, or Failed."""
+    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row  # This lets us return dicts easily
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT * FROM tasks 
+               WHERE project_id = ? AND status NOT IN ('Completed', 'Terminated') 
+               ORDER BY updated_at DESC""",
+            (project_id,)
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+def get_pipeline_task(task_id: str):
+    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+def update_task_status(task_id: str, new_status: str):
+    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+        conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+            (new_status, datetime.utcnow().isoformat(), task_id)
+        )
+        conn.commit()
+
+def get_sessions_by_project(project_id: str):
+    """Fetches all unique ticket and session combinations for a specific project."""
+    with get_db_conn() as conn:
+        conn.row_factory = sqlite3.Row 
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT ticket_id, session_id, MAX(timestamp) as last_active
+            FROM activity_logs 
+            WHERE project_id = ? AND ticket_id IS NOT NULL
+            GROUP BY ticket_id, session_id
+            ORDER BY last_active DESC
+        ''', (project_id,))
         return [dict(row) for row in cursor.fetchall()]

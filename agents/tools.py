@@ -245,6 +245,7 @@ def run_terminal_command(thought: str, command: str, config: RunnableConfig) -> 
 
     # Grab the globally stored repo path
     repo_root = config.get("configurable", {}).get("repo_root", ".")
+    export_prefix = config.get("configurable", {}).get("export_prefix", "")
     
     if any(keyword in command.lower() for keyword in install_keywords):
         # Safely append standard ignores and remove duplicates (using sort -u) without interrupting the actual command.
@@ -255,30 +256,14 @@ def run_terminal_command(thought: str, command: str, config: RunnableConfig) -> 
             f"fi;"
         )
         command = f"{command}\n{gitignore_safeguard}"
-    
-    # Extract the specific tenant's config
-    tenant_config = config.get("configurable", {}).get("tenant_config", {})
-    
-    # Fallback to os.environ ONLY for local dev/testing
-    github_token = tenant_config.get("github_token") or os.environ.get("GITHUB_TOKEN")
-    github_repo = tenant_config.get("github_repo") or os.environ.get("GITHUB_REPO")
-    client_secrets = tenant_config.get("secrets", {})
 
-    # Merge everything into the secure terminal environment
-    tool_envs = {
-        "GITHUB_TOKEN": github_token,
-        "GITHUB_REPO": github_repo,
-        **client_secrets
-    }
-    
-    # Auto-navigate before running the AI's command
-    full_command = f"cd '{repo_root}' && {command}"
+    # Inject the exports BEFORE the directory navigation and command
+    full_command = f"{export_prefix}cd '{repo_root}' && {command}"
 
     try:
         # We execute the modified command string in the E2B sandbox
         execution = workspace.commands.run(
             full_command,
-            envs=tool_envs,
             timeout=120
         )
         
@@ -361,14 +346,16 @@ def update_linear_ticket(message: str, config: RunnableConfig) -> str:
         return "Error: System failed to inject the active ticket ID."
     
     tenant_config = config.get("configurable", {}).get("tenant_config", {})
-    linear_api_key = tenant_config.get("linear_api_key") or os.environ.get("LINEAR_API_KEY")
+    # Intelligently support BOTH the new OAuth token and the legacy API key
+    linear_token = tenant_config.get("linear_access_token") or tenant_config.get("linear_api_key") or os.environ.get("LINEAR_API_KEY")
     
-    if not linear_api_key:
-        return "Error: LINEAR_API_KEY is missing in tenant configuration."
+    if not linear_token:
+        # Return a soft warning instead of an Error so the AI can gracefully proceed to FINISH
+        return "Warning: Linear integration is missing or disconnected. Ticket update skipped."
 
     url = "https://api.linear.app/graphql"
     headers = {
-        "Authorization": linear_api_key,
+        "Authorization": f"Bearer {linear_token}", # OAuth tokens require the Bearer prefix
         "Content-Type": "application/json",
     }
     
@@ -574,32 +561,29 @@ def manage_dev_server(thought: str, action: str, command: str, config: RunnableC
     if action == "start":
         if not command: return "Error: Must provide a command."
         
+        export_prefix = config.get("configurable", {}).get("export_prefix", "")
+        repo_root = config.get("configurable", {}).get("repo_root", ".")
+
         # Clean up old state first
         workspace.commands.run(f"rm {log_file} {pid_file} || echo 'clean'")
-
-        # Extract tenant secrets for the background server
-        tenant_config = config.get("configurable", {}).get("tenant_config", {})
-        client_secrets = tenant_config.get("secrets", {})
 
         try:
             # Force write the initial line BEFORE starting the server
             workspace.files.write(log_file, "=== SERVER INITIALIZING IN BACKGROUND ===\nWait at least 20s for logs to appear...\n")
 
             # Intelligently find the directory containing firebase.json
-            repo_root = config.get("configurable", {}).get("repo_root", ".")
             cd_cmd = f"cd $(find '{repo_root}' -maxdepth 3 -name firebase.json -printf '%h\\n' | head -n 1) || cd '{repo_root}'"
             
             # Native E2B background execution.
             # We must manually redirect stdout/stderr to a file within the command if we want to read the logs later.
             # Use '>>' to APPEND to the log file so we don't erase the line we just wrote
             # Group the commands inside { } so that ALL output (even from the cd command) is captured in the log file.
-            secure_command = f"{{ {cd_cmd} && {command}; }} >> {log_file} 2>&1"
+            secure_command = f"{{ {export_prefix}{cd_cmd} && {command}; }} >> {log_file} 2>&1"
             
             # Inject only THIS client's secrets
             process = workspace.commands.run(
                 f"bash -c {shlex.quote(secure_command)}", 
                 background=True,
-                envs=client_secrets 
             )
             
             # Record the PID
@@ -680,6 +664,9 @@ def manage_dev_server(thought: str, action: str, command: str, config: RunnableC
             CUSTOM_PORTS=$(grep -o '"port": *[0-9]*' "$FIREBASE_JSON" | grep -o '[0-9]*')
             PORTS="$PORTS $CUSTOM_PORTS"
         fi
+
+        echo "Cleaning up Firebase processes..."
+        pkill -f "firebase" || true
         
         # 3. Use fuser to find processes on these ports and kill them gracefully
         for PORT in $PORTS; do
@@ -707,6 +694,12 @@ def manage_dev_server(thought: str, action: str, command: str, config: RunnableC
 def inspect_frontend(thought: str, url: str, config: RunnableConfig, wait_for_selector: str = "") -> str:
     """Opens a headless browser, navigates to the URL, and returns console errors and network failures."""
     workspace = config.get("configurable", {}).get("sandbox")
+    repo_root = config.get("configurable", {}).get("repo_root", ".")
+
+    # Create a unique filename inside the repo root
+    script_name = f"inspect_{int(time.time())}.js"
+    script_path = os.path.join(repo_root, script_name)
+
     if not workspace:
         return "Error: No active sandbox."
     
@@ -719,10 +712,23 @@ def inspect_frontend(thought: str, url: str, config: RunnableConfig, wait_for_se
             const page = await browser.newPage();
             const errors = [];
             
+            // ENRICHED CONSOLE ERRORS (Includes Line Numbers & Files)
             page.on('console', msg => {{ 
-                if(msg.type() === 'error' || msg.type() === 'warning') errors.push(`[${{msg.type().toUpperCase()}}] ${{msg.text()}}`); 
+                if(msg.type() === 'error' || msg.type() === 'warning') {{
+                    const loc = msg.location();
+                    const locStr = loc.url ? ` (at ${{loc.url}}:${{loc.lineNumber}})` : '';
+                    errors.push(`[${{msg.type().toUpperCase()}}] ${{msg.text()}}${{locStr}}`); 
+                }}
             }});
+            
             page.on('pageerror', err => errors.push(`[PAGE CRASH] ${{err.message}}`));
+            
+            // EXPLICIT NETWORK TRACKING (Captures exact failing API URLs)
+            page.on('response', response => {{
+                if (response.status() >= 400) {{
+                    errors.push(`[NETWORK ${{response.status()}}] ${{response.request().method()}} ${{response.url()}}`);
+                }}
+            }});
             
             // Hijack setTimeout to force all delays to 0ms in the test environment
             await page.addInitScript(() => {{
@@ -760,12 +766,17 @@ def inspect_frontend(thought: str, url: str, config: RunnableConfig, wait_for_se
         }}
     }})();
     """
-    workspace.files.write("/tmp/inspect.js", script)
+    workspace.files.write(script_path, script)
     
-    # Explicitly tell Playwright exactly where we stored the browsers in the Docker image
-    cmd = "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright NODE_PATH=$(npm root -g) node /tmp/inspect.js"
+    # Grab the global prefix and execute cleanly(adding NODE_PATH back inline so Bash can evaluate it)
+    export_prefix = config.get("configurable", {}).get("export_prefix", "")
+    cmd = f"{export_prefix}NODE_PATH=$(npm root -g) node {script_path}"
+
     res = workspace.commands.run(cmd)
     
+    # Clean up the file after running so the directory stays clean
+    workspace.commands.run(f"rm {script_path}")
+
     return res.stdout or res.stderr
 
 @tool(args_schema=WebSearchInput)
@@ -798,11 +809,14 @@ def generate_repo_map(thought: str, target_dir: str, config: RunnableConfig) -> 
     if not workspace:
         return "Error: No active sandbox found in configuration."
 
+    # Define the blueprint variable here so it is generalized and easy to change later
+    plan_filename = "TECHNICAL_PLAN.md"
+
     # This Python script will run inside the E2B sandbox to rapidly aggregate the codebase
     ingest_script = textwrap.dedent("""
     import os
 
-    def generate_map(root_dir):
+    def generate_map(root_dir, plan_filename):
         ignore_dirs = {'.git', 'node_modules', 'venv', '.venv', '__pycache__', 'build', 'dist', '.next', '.firebase'}
         ignore_exts = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.pdf', '.zip', '.tar', '.gz', '.mp4', '.pyc', '.lock'}
         
@@ -824,7 +838,12 @@ def generate_repo_map(thought: str, target_dir: str, config: RunnableConfig) -> 
                 if ext in ignore_exts or f.endswith('-lock.json'):
                     continue
                 
+                # ALWAYS add to the Directory Tree so the AI knows it exists
                 tree_str += f"{subindent}{f}\\n"
+
+                # SKIP adding to File Contents if it is plan file
+                if f == plan_filename:
+                    continue
                 
                 filepath = os.path.join(dirpath, f)
                 try:
@@ -848,9 +867,10 @@ def generate_repo_map(thought: str, target_dir: str, config: RunnableConfig) -> 
         
         # Accept the path passed from the LangGraph config
         target = sys.argv[1] if len(sys.argv) > 1 else "."
+        plan_file_arg = sys.argv[2] if len(sys.argv) > 2 else ""
         
         if os.path.exists(os.path.join(target, ".git")):
-            print(generate_map(target))
+            print(generate_map(target, plan_file_arg))
         else:
             print(f"Error: No git repository found at {target}. You must clone the repository first.")
     """)
@@ -868,7 +888,9 @@ def generate_repo_map(thought: str, target_dir: str, config: RunnableConfig) -> 
 
         # Write the script to the sandbox and execute it against the actual_target
         workspace.files.write("/tmp/ingest_repo.py", ingest_script)
-        res = workspace.commands.run(f"python3 /tmp/ingest_repo.py '{actual_target}'")
+
+        # Pass the plan_filename as the second argument to the inner python script
+        res = workspace.commands.run(f"python3 /tmp/ingest_repo.py '{actual_target}' '{plan_filename}'")
         
         output = res.stdout or res.stderr
         return output if output else "Repository map generated, but it was empty."
