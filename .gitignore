@@ -20,6 +20,7 @@ pids
 # Agency Specific Databases & Persistence
 # These contain local run history and checkpoints
 agency_logs.db
+pipeline.db
 checkpoints.sqlite
 *.db-shm
 *.db-wal
