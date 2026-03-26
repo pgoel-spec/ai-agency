@@ -135,7 +135,7 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
         return {"status": "Ignored", "message": "Project is currently paused or missing."}
 
     # --- 2. Extract and define the exact Nomenclature IDs ---
-    url = payload.get("url", "")
+    url = payload.get("url") or payload.get("data", {}).get("issue", {}).get("url") or payload.get("data", {}).get("url", "")
     match = re.search(r'https://linear\.app/([^/]+)/issue/([A-Za-z]+-\d+)', url)
     
     if match:

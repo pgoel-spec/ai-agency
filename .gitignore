@@ -20,8 +20,8 @@ pids
 # Agency Specific Databases & Persistence
 # These contain local run history and checkpoints
 agency_logs.db
-pipeline.db
 checkpoints.sqlite
+pipeline.db
 *.db-shm
 *.db-wal
 *.sqlite-shm
@@ -65,3 +65,5 @@ test.py
 output
 output/
 tenant_vault.json
+
+/inspect_db.py
