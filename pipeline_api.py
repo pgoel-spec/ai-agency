@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
-from database import get_active_tasks, get_pipeline_task, update_task_status
+from database import get_active_tasks, get_pipeline_task, update_task_status, get_completed_tasks
 from engine import run_pipeline_task
 from onboarding import get_vault
 
@@ -36,3 +36,8 @@ def api_terminate_task(project_id: str, task_id: str):
     # but it stops it from being retried and clears the dashboard).
     update_task_status(task_id, "Terminated")
     return {"success": True, "message": "Task terminated"}
+
+@router.get("/api/project/{project_id}/pipeline/completed")
+def api_get_completed_pipeline(project_id: str):
+    tasks = get_completed_tasks(project_id)
+    return {"success": True, "tasks": tasks}

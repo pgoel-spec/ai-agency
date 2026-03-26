@@ -200,33 +200,88 @@ async def api_test_linear_webhook(project_id: str):
 # ==========================================
 # 4. HTML RENDER HELPERS
 # ==========================================
+# onboarding.py (Partial updates to HTML strings)
+
 def get_layout_header():
     return """
+    <script>
+        // Universally inject Dark Mode logic so it works on all pages
+        if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+            document.documentElement.classList.add('dark');
+        } else {
+            document.documentElement.classList.remove('dark');
+        }
+        window.toggleTheme = function() {
+            document.documentElement.classList.toggle('dark');
+            localStorage.theme = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+        };
+    </script>
     <header class="h-16 bg-white dark:bg-log-surface border-b border-gray-200 dark:border-log-border flex items-center justify-between px-6 flex-shrink-0 z-40">
-        <div class="flex items-center space-x-2">
-            <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold">AI</div>
-            <span class="text-xl font-bold text-gray-900 dark:text-log-text tracking-wider">AI AGENCY</span>
-        </div>
-        <button onclick="toggleTheme()" class="p-2 rounded-lg bg-gray-100 dark:bg-[#333333] text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 transition">
+        <a href="/" class="flex items-center space-x-2 transition hover:opacity-80">
+            <div class="w-8 h-8 bg-blue-600 rounded flex items-center justify-center text-white font-medium">AI</div>
+            <span class="text-xl font-medium text-gray-900 dark:text-log-text tracking-wider">AI AGENCY</span>
+        </a>
+        <button onclick="toggleTheme()" class="p-2 rounded bg-gray-100 dark:bg-[#333333] text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 transition">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
         </button>
     </header>
     """
 
 def get_sidebar_html(active_page="dashboard"):
+    """Global sidebar used on Dashboard and Global Logs."""
+    vault = get_vault()
+    
     dash_active = "bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 font-medium" if active_page == "dashboard" else "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-[#333333]"
     logs_active = "bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 font-medium" if active_page == "logs" else "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-[#333333]"
     
+    # Updated: "Select Project..." instead of "Jump to Workspace..."
+    dropdown_options = '<option value="">Select Project...</option>'
+    for pid, data in vault.items():
+        pname = data.get("project_name", pid)
+        dropdown_options += f'<option value="{pid}">{pname}</option>'
+    
     return f"""
     <div class="w-64 bg-white dark:bg-log-surface border-r border-gray-200 dark:border-log-border flex flex-col flex-shrink-0">
+        <div class="p-4 border-b border-gray-200 dark:border-log-border">
+            <select onchange="if(this.value) window.location.href='/project/' + this.value" class="w-full bg-gray-50 dark:bg-[#333333] text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 transition cursor-pointer">
+                {dropdown_options}
+            </select>
+        </div>
         <nav class="flex-1 p-4 space-y-2">
-            <a href="/" class="flex items-center space-x-3 px-4 py-3 rounded-lg transition {dash_active}">
+            <a href="/" class="flex items-center space-x-3 px-4 py-3 rounded transition {dash_active}">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path></svg>
                 <span>Dashboard</span>
             </a>
-            <a href="/logs" class="flex items-center space-x-3 px-4 py-3 rounded-lg transition {logs_active}">
+            <a href="/logs" class="flex items-center space-x-3 px-4 py-3 rounded transition {logs_active}">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
-                <span>System Logs</span>
+                <span>Run History</span>
+            </a>
+        </nav>
+    </div>
+    """
+
+def get_project_sidebar_html(project_id, project_name, active_page="pipeline"):
+    """Project-specific sidebar. Note we now pass project_id to build the links."""
+    pipe_active = "bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 font-medium" if active_page == "pipeline" else "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-[#333333]"
+    
+    # The logs link is no longer a JS tab, it navigates to the global logs page with a filter
+    return f"""
+    <div class="w-64 bg-white dark:bg-log-surface border-r border-gray-200 dark:border-log-border flex flex-col flex-shrink-0">
+        <div class="p-4 border-b border-gray-200 dark:border-log-border">
+            <a href="/" class="text-sm text-gray-500 hover:text-blue-500 transition flex items-center mb-2">
+                <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                Back to Dashboard
+            </a>
+            <h2 class="font-medium text-gray-900 dark:text-white truncate" title="{project_name}">{project_name}</h2>
+        </div>
+        <nav class="flex-1 p-4 space-y-2">
+            <a href="/project/{project_id}" class="flex items-center space-x-3 px-4 py-3 rounded transition {pipe_active}">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                <span>Ticket Pipeline</span>
+            </a>
+            <a href="/logs?project={project_id}" class="flex items-center space-x-3 px-4 py-3 rounded transition text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-[#333333]">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                <span>Run History</span>
             </a>
         </nav>
     </div>
@@ -240,27 +295,27 @@ def generate_card_html(proj_id, data):
     is_active = data.get("is_active", True)
     
     has_linear = bool(data.get("linear_access_token") or data.get("linear_api_key"))
-    tracker_badge = '<span class="px-2 py-1 bg-green-100 dark:bg-green-900/40 text-green-800 dark:text-green-400 text-xs font-medium rounded-full">Connected</span>' if has_linear else '<span class="px-2 py-1 bg-yellow-100 dark:bg-yellow-900/40 text-yellow-800 dark:text-yellow-400 text-xs font-medium rounded-full">Pending</span>'
+    tracker_badge = '<span class="px-2 py-1 bg-green-50 dark:bg-green-900/20 border border-green-200 text-green-700 dark:text-green-400 text-xs font-medium rounded">Connected</span>' if has_linear else '<span class="px-2 py-1 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 text-yellow-700 dark:text-yellow-400 text-xs font-medium rounded">Pending</span>'
     
     gh_status = data.get("github_webhook_status", "pending")
-    if gh_status == "success": gh_badge = '<span class="px-2 py-1 bg-green-100 dark:bg-green-900/40 text-green-800 dark:text-green-400 text-xs font-medium rounded-full">Active</span>'
-    elif gh_status == "pending": gh_badge = '<span class="px-2 py-1 bg-gray-100 dark:bg-[#333333] text-gray-600 dark:text-gray-300 text-xs font-medium rounded-full">Pending Check</span>'
-    else: gh_badge = '<span class="px-2 py-1 bg-red-100 dark:bg-red-900/40 text-red-800 dark:text-red-400 text-xs font-medium rounded-full">Failed</span>'
+    if gh_status == "success": gh_badge = '<span class="px-2 py-1 bg-green-50 dark:bg-green-900/20 border border-green-200 text-green-700 dark:text-green-400 text-xs font-medium rounded">Active</span>'
+    elif gh_status == "pending": gh_badge = '<span class="px-2 py-1 bg-gray-50 dark:bg-[#333333] border border-gray-200 text-gray-600 dark:text-gray-300 text-xs font-medium rounded">Pending Check</span>'
+    else: gh_badge = '<span class="px-2 py-1 bg-red-50 dark:bg-red-900/20 border border-red-200 text-red-700 dark:text-red-400 text-xs font-medium rounded">Failed</span>'
     
     has_lin_str = "true" if has_linear else "false"
     bg_color = "bg-blue-600" if is_active else "bg-gray-300 dark:bg-[#333333]"
     translate_dot = "translate-x-5" if is_active else "translate-x-0"
 
     return f"""
-    <a href="/project/{proj_id}" class="block bg-white dark:bg-log-surface p-6 rounded-xl shadow-sm border border-gray-100 dark:border-log-border flex flex-col justify-between relative group hover:shadow-md transition cursor-pointer">
+    <div class="bg-white dark:bg-log-surface p-6 rounded border border-gray-200 dark:border-log-border flex flex-col justify-between relative">
         <div>
             <div class="flex justify-between items-start mb-1">
-                <h3 class="text-lg font-bold text-gray-800 dark:text-log-text break-all pr-2 group-hover:text-blue-500 transition-colors">{proj_name}</h3>
-                <div class="flex space-x-2 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button onclick="event.preventDefault(); event.stopPropagation(); openModal('{proj_id}', '{proj_name}', '{repo}', '{token}', '{gh_status}', {has_lin_str})" class="text-gray-400 hover:text-blue-600 transition bg-white dark:bg-log-surface rounded-full p-1 shadow-sm" title="Edit Project">
+                <h3 class="text-lg font-medium text-gray-800 dark:text-log-text break-all pr-2">{proj_name}</h3>
+                <div class="flex space-x-2 flex-shrink-0">
+                    <button onclick="event.preventDefault(); event.stopPropagation(); openModal('{proj_id}', '{proj_name}', '{repo}', '{token}', '{gh_status}', {has_lin_str})" class="text-gray-400 hover:text-blue-600 transition bg-transparent p-1" title="Edit Project">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg>
                     </button>
-                    <button onclick="event.preventDefault(); event.stopPropagation(); deleteProject('{proj_id}')" class="text-gray-400 hover:text-red-600 transition bg-white dark:bg-log-surface rounded-full p-1 shadow-sm" title="Delete Project">
+                    <button onclick="event.preventDefault(); event.stopPropagation(); deleteProject('{proj_id}')" class="text-gray-400 hover:text-red-600 transition bg-transparent p-1" title="Delete Project">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
                     </button>
                 </div>
@@ -268,33 +323,33 @@ def generate_card_html(proj_id, data):
             
             <p class="text-xs text-gray-400 mb-4">Added: {created_at}</p>
             
-            <p class="text-sm text-gray-500 dark:text-gray-400 mb-4 flex items-center">
+            <div class="text-sm text-gray-500 dark:text-gray-400 mb-4 flex items-center">
                 <svg class="w-4 h-4 mr-1 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
-                {repo}
-            </p>
+                <a href="https://github.com/{repo}" target="_blank" class="hover:text-blue-500 transition hover:underline">{repo}</a>
+            </div>
         </div>
         
         <div>
             <div class="flex items-center justify-between border-t border-gray-100 dark:border-log-border pt-3 mt-2">
-                <span class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase">1. GitHub Webhook</span>
+                <span class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">1. GitHub Webhook</span>
                 {gh_badge}
             </div>
             <div class="flex items-center justify-between border-t border-gray-100 dark:border-log-border pt-3 mt-3">
-                <span class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase">2. Issue Tracking</span>
+                <span class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">2. Issue Tracking</span>
                 {tracker_badge}
             </div>
 
             <div class="mt-4 pt-4 border-t border-gray-100 dark:border-log-border flex items-center justify-between">
-                <span class="text-blue-500 text-sm font-medium opacity-0 group-hover:opacity-100 transition-opacity">Open Workspace →</span>
+                <a href="/project/{proj_id}" class="text-blue-500 text-sm font-medium hover:underline transition">Open Workspace →</a>
                 <button type="button" onclick="event.preventDefault(); event.stopPropagation(); toggleActive('{proj_id}', {str(not is_active).lower()})" class="flex items-center cursor-pointer" title="Pause or Resume AI Processing">
-                    <span class="text-xs font-semibold text-gray-500 dark:text-gray-400 mr-2 uppercase">{"Active" if is_active else "Paused"}</span>
+                    <span class="text-xs font-medium text-gray-500 dark:text-gray-400 mr-2 uppercase">{"Active" if is_active else "Paused"}</span>
                     <div class="w-10 h-5 flex items-center {bg_color} rounded-full p-1 transition duration-300 ease-in-out">
-                        <div class="bg-white w-3.5 h-3.5 rounded-full shadow-md transform {translate_dot} transition duration-300 ease-in-out"></div>
+                        <div class="bg-white w-3.5 h-3.5 rounded-full transform {translate_dot} transition duration-300 ease-in-out"></div>
                     </div>
                 </button>
             </div>
         </div>
-    </a>
+    </div>
     """
 
 def get_modal_html():
@@ -467,12 +522,11 @@ def admin_dashboard():
 
             <div class="flex flex-1 overflow-hidden">
                 {get_sidebar_html("dashboard")}
-                
                 <div class="flex-1 overflow-y-auto p-8">
                     <div class="max-w-5xl mx-auto">
                         <div class="flex justify-between items-center mb-8 pb-4 border-b border-gray-200 dark:border-gray-700">
                             <div>
-                                <h1 class="text-2xl font-bold text-gray-900 dark:text-white">Project Overview</h1>
+                                <h1 class="text-2xl font-medium mb-6 text-gray-900 dark:text-log-text">Dashboard</h1>
                                 <p class="text-gray-600 dark:text-gray-400 mt-1">Manage your active AI workspaces.</p>
                             </div>
                             <button onclick="openModal()" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-6 rounded-lg shadow-sm transition flex items-center">
@@ -824,49 +878,40 @@ def project_workspace(project_id: str = Path(...)):
             <title>{project_name} - AI Agency</title>
             <script src="https://cdn.tailwindcss.com"></script>
             <script>
-                tailwind.config = {{ darkMode: 'class', theme: {{ extend: {{ colors: {{ 'log-bg': '#1e1e1e', 'log-surface': '#252526', 'log-border': '#333333' }} }} }} }}
-                if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {{
-                    document.documentElement.classList.add('dark');
-                }}
+                tailwind.config = {{ darkMode: 'class', theme: {{ extend: {{ colors: {{ 'log-bg': '#1e1e1e', 'log-surface': '#252526', 'log-border': '#333333', 'log-text': '#d4d4d4' }} }} }} }};
             </script>
         </head>
         <body class="bg-gray-50 dark:bg-log-bg h-screen flex flex-col">
             {get_layout_header()}
             <div class="flex flex-1 overflow-hidden">
-                {get_sidebar_html("dashboard")}
+                {get_project_sidebar_html(project_id, project_name, "pipeline")}
                 
                 <div class="flex-1 overflow-y-auto p-8">
                     <div class="max-w-5xl mx-auto">
                         <div class="flex justify-between items-center mb-8">
                             <div>
-                                <a href="/" class="text-sm text-blue-500 hover:underline mb-2 inline-block">← Back to Dashboard</a>
-                                <h1 class="text-3xl font-bold text-gray-900 dark:text-white">{project_name} Workspace</h1>
+                                <h1 class="text-3xl font-medium text-gray-900 dark:text-white">Workspace</h1>
                                 <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Project ID: {project_id}</p>
                             </div>
                             <input type="hidden" id="project-id" value="{project_id}">
                         </div>
 
-                        <div class="border-b border-gray-200 dark:border-log-border mb-6">
-                            <nav class="-mb-px flex space-x-8">
-                                <button onclick="switchTab('pipeline')" id="tab-pipeline" class="border-blue-500 text-blue-600 dark:text-blue-400 whitespace-nowrap pb-4 px-1 border-b-2 font-medium text-sm">Active Pipeline</button>
-                                <button onclick="switchTab('logs')" id="tab-logs" class="border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 whitespace-nowrap pb-4 px-1 border-b-2 font-medium text-sm">Run History</button>
-                            </nav>
-                        </div>
-
-                        <div id="content-pipeline" class="block">
+                        <div>
                             <div class="flex items-center gap-2 mb-4">
                                 <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
-                                <h2 class="text-lg font-bold text-gray-900 dark:text-white">Live Tasks</h2>
+                                <h2 class="text-lg font-medium text-gray-900 dark:text-white">Live Tickets</h2>
                             </div>
-                            <div id="pipeline-container" class="space-y-3">
-                                <p class="text-sm text-gray-500 italic">Fetching pipeline...</p>
+                            <div id="pipeline-container" class="space-y-3 mb-8">
+                                <!-- Unified loading text -->
+                                <p class="text-sm text-gray-500 dark:text-gray-400">Fetching tickets...</p>
                             </div>
-                        </div>
-
-                        <div id="content-logs" class="hidden">
-                            <h2 class="text-lg font-bold text-gray-900 dark:text-white mb-4">Past Executions</h2>
-                            <div class="space-y-3">
-                                {logs_html}
+                            
+                            <div class="flex items-center gap-2 mb-4 mt-8 pt-6 border-t border-gray-200 dark:border-log-border">
+                                <h2 class="text-lg font-medium text-gray-900 dark:text-white">Completed & Dismissed Tickets</h2>
+                            </div>
+                            <div id="completed-pipeline-container" class="space-y-3">
+                                <!-- Unified loading text -->
+                                <p class="text-sm text-gray-500 dark:text-gray-400">Fetching tickets...</p>
                             </div>
                         </div>
                     </div>
@@ -874,99 +919,126 @@ def project_workspace(project_id: str = Path(...)):
             </div>
 
             <script>
-                // Tab Switching Logic
-                function switchTab(tab) {{
-                    document.getElementById('content-pipeline').classList.toggle('hidden', tab !== 'pipeline');
-                    document.getElementById('content-logs').classList.toggle('hidden', tab !== 'logs');
-                    
-                    document.getElementById('tab-pipeline').className = tab === 'pipeline' 
-                        ? "border-blue-500 text-blue-600 dark:text-blue-400 whitespace-nowrap pb-4 px-1 border-b-2 font-medium text-sm" 
-                        : "border-transparent text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 hover:border-gray-300 whitespace-nowrap pb-4 px-1 border-b-2 font-medium text-sm";
-                        
-                    document.getElementById('tab-logs').className = tab === 'logs' 
-                        ? "border-blue-500 text-blue-600 dark:text-blue-400 whitespace-nowrap pb-4 px-1 border-b-2 font-medium text-sm" 
-                        : "border-transparent text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 hover:border-gray-300 whitespace-nowrap pb-4 px-1 border-b-2 font-medium text-sm";
-                }}
-
-                // Pipeline Polling Logic (Reusing your exact API)
                 async function fetchPipeline() {{
                     const pId = document.getElementById('project-id').value;
                     try {{
-                        const res = await fetch(`/api/project/${{pId}}/pipeline`);
+                        const res = await fetch('/api/project/' + pId + '/pipeline');
                         const data = await res.json();
                         const container = document.getElementById('pipeline-container');
-
+                        
                         if (!data.tasks || data.tasks.length === 0) {{
-                            container.innerHTML = '<p class="text-sm text-gray-500 dark:text-gray-400 italic bg-white dark:bg-[#252526] p-4 rounded border border-gray-200 dark:border-log-border">All clear! No active tasks.</p>';
+                            container.innerHTML = '<p class="text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-[#252526] p-4 rounded border border-gray-200 dark:border-log-border">No live tickets currently processing.</p>';
                             return;
                         }}
 
                         let html = '';
-                        data.tasks.forEach(task => {{
-                            let statusColor = "text-yellow-600 bg-yellow-50 dark:bg-yellow-900/20 border-yellow-200";
-                            let icon = "⏳";
-                            let controls = "";
-
-                            if (task.status === "Running") {{
-                                statusColor = "text-blue-600 bg-blue-50 dark:bg-blue-900/20 border-blue-200";
-                                icon = "⚙️";
-                                controls = `<a href="/logs/${{task.task_id.split('-')[0]}}/${{task.task_id}}" target="_blank" class="text-xs text-blue-500 hover:underline">View Live Logs →</a>`;
-                            }} else if (task.status === "Failed") {{
-                                statusColor = "text-red-600 bg-red-50 dark:bg-red-900/20 border-red-200";
-                                icon = "❌";
-                                controls = `
-                                    <button onclick="restartTask(event, '${{task.task_id}}')" class="text-xs bg-gray-900 dark:bg-gray-100 text-white dark:text-black px-3 py-1 rounded hover:opacity-80 transition">Restart</button>
-                                    <button onclick="terminateTask('${{task.task_id}}')" class="text-xs text-gray-500 hover:text-red-500 transition px-2 py-1">Dismiss</button>
-                                `;
-                            }} else if (task.status === "Pending") {{
-                                // Add controls for stuck Pending tasks (e.g. after a server restart)
-                                statusColor = "text-yellow-600 bg-yellow-50 dark:bg-yellow-900/20 border-yellow-200";
-                                icon = "⏳";
-                                controls = `
-                                    <button onclick="restartTask(event, '${{task.task_id}}')" class="text-xs bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 transition shadow-sm">Force Start</button>
-                                    <button onclick="terminateTask('${{task.task_id}}')" class="text-xs text-gray-500 hover:text-red-500 transition px-2 py-1">Dismiss</button>
-                                `;
+                        data.tasks.forEach(function(task) {{
+                            // Added safety checks so the loop never breaks
+                            let tId = task.task_id || 'Unknown';
+                            let parts = tId.split('-');
+                            let sId = parts.pop();           // Extracts the timestamp (1774207968)
+                            let ticketId = parts.join('-');  // Rejoins the rest (ai-agency-ws-AI-6)
+                            let statusStr = (task.status || 'Unknown').toUpperCase();
+                            
+                            // Default controls (Just View Logs)
+                            let controls = '<a href="/logs/' + ticketId + '/' + sId + '" target="_blank" class="text-xs text-blue-500 hover:underline transition ml-2">View Logs</a>';
+                            
+                            // Add action buttons if the task is stuck or failed
+                            if (task.status === "Failed" || task.status === "Pending") {{
+                                let btnText = task.status === "Failed" ? "Restart" : "Force Start";
+                                controls = '<button onclick="restartTask(event, \\'' + tId + '\\')" class="text-xs bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 hover:bg-blue-100 border border-blue-200 dark:border-blue-800 px-3 py-1 rounded transition">' + btnText + '</button>' +
+                                           '<button onclick="terminateTask(\\'' + tId + '\\')" class="text-xs text-gray-500 hover:text-red-500 px-3 py-1 transition">Dismiss</button>' + 
+                                           controls;
                             }}
 
-                            html += `
-                            <div class="flex items-center justify-between p-4 bg-white dark:bg-[#252526] border border-gray-200 dark:border-log-border rounded-lg shadow-sm mb-3">
-                                <div class="flex items-center gap-4">
-                                    <div class="px-2 py-1 rounded text-xs font-bold border ${{statusColor}}">
-                                        ${{icon}} ${{task.status.toUpperCase()}}
-                                    </div>
-                                    <div>
-                                        <div class="font-mono text-sm font-bold text-gray-900 dark:text-gray-100">${{task.task_id}}</div>
-                                        <div class="text-xs text-gray-500 mt-1">Updated: ${{new Date(task.updated_at).toLocaleTimeString()}}</div>
-                                    </div>
-                                </div>
-                                <div class="flex items-center gap-3">
-                                    ${{controls}}
-                                </div>
-                            </div>`;
+                            let statusColor = task.status === "Failed" ? "text-red-600 bg-red-50 dark:bg-red-900/20 border-red-200" : "text-blue-600 bg-blue-50 dark:bg-blue-900/20 border-blue-200";
+
+                            html += '<div class="flex items-center justify-between p-4 bg-white dark:bg-[#252526] border border-gray-200 dark:border-log-border rounded mb-3">' +
+                                        '<div class="flex items-center gap-4">' +
+                                            '<div class="px-2 py-1 rounded text-xs font-medium border ' + statusColor + '">' +
+                                                statusStr +
+                                            '</div>' +
+                                            '<div>' +
+                                                '<div class="font-mono text-sm font-medium text-gray-900 dark:text-gray-100">' + tId + '</div>' +
+                                            '</div>' +
+                                        '</div>' +
+                                        '<div class="flex items-center gap-2">' +
+                                            controls +
+                                        '</div>' +
+                                    '</div>';
                         }});
                         container.innerHTML = html;
                     }} catch (err) {{
-                        console.error("Pipeline fetch failed", err);
+                        console.error("Error fetching live pipeline:", err);
+                        document.getElementById('pipeline-container').innerHTML = '<p class="text-sm text-red-500 p-4">Error loading live tickets.</p>';
+                    }}
+                }}
+
+                async function fetchCompletedPipeline() {{
+                    const pId = document.getElementById('project-id').value;
+                    try {{
+                        const res = await fetch('/api/project/' + pId + '/pipeline/completed');
+                        const data = await res.json();
+                        const container = document.getElementById('completed-pipeline-container');
+
+                        if (!data.tasks || data.tasks.length === 0) {{
+                            container.innerHTML = '<p class="text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-[#252526] p-4 rounded border border-gray-200 dark:border-log-border">No completed tickets yet.</p>';
+                            return;
+                        }}
+
+                        let html = '';
+                        data.tasks.forEach(function(task) {{
+                            // Added safety checks
+                            let statusColor = task.status === "Terminated" ? "text-gray-600 bg-gray-50 dark:bg-[#333333] border-gray-200 dark:border-gray-600" : "text-green-600 bg-green-50 dark:bg-green-900/20 border-green-200";
+                            let tId = task.task_id || 'Unknown';
+                            let parts = tId.split('-');
+                            let sId = parts.pop();           // Extracts the timestamp (1774207968)
+                            let ticketId = parts.join('-');  // Rejoins the rest (ai-agency-ws-AI-6)
+                            let timeStr = task.updated_at ? new Date(task.updated_at).toLocaleTimeString() : 'Unknown Time';
+                            let statusStr = (task.status || 'Unknown').toUpperCase();
+                            
+                            html += '<div class="flex items-center justify-between p-4 bg-white dark:bg-[#252526] border border-gray-200 dark:border-log-border rounded mb-3 opacity-80">' +
+                                        '<div class="flex items-center gap-4">' +
+                                            '<div class="px-2 py-1 rounded text-xs font-medium border ' + statusColor + '">' +
+                                                statusStr +
+                                            '</div>' +
+                                            '<div>' +
+                                                '<div class="font-mono text-sm font-medium text-gray-900 dark:text-gray-100">' + tId + '</div>' +
+                                                '<div class="text-xs text-gray-500 mt-1">Finished: ' + timeStr + '</div>' +
+                                            '</div>' +
+                                        '</div>' +
+                                        '<div class="flex items-center gap-3">' +
+                                            '<a href="/logs/' + ticketId + '/' + sId + '" target="_blank" class="text-xs text-blue-500 hover:underline">View Logs</a>' +
+                                        '</div>' +
+                                    '</div>';
+                        }});
+                        container.innerHTML = html;
+                    }} catch (err) {{ 
+                        console.error("Error fetching completed pipeline:", err); 
+                        document.getElementById('completed-pipeline-container').innerHTML = '<p class="text-sm text-red-500 p-4">Error loading completed tickets.</p>';
                     }}
                 }}
 
                 async function restartTask(event, taskId) {{
                     const pId = document.getElementById('project-id').value;
-                    event.target.innerText = "Restarting...";
+                    event.target.innerText = "Starting...";
                     event.target.disabled = true;
-                    await fetch(`/api/project/${{pId}}/task/${{taskId}}/restart`, {{ method: 'POST' }});
+                    await fetch('/api/project/' + pId + '/task/' + taskId + '/restart', {{ method: 'POST' }});
                     fetchPipeline();
                 }}
 
                 async function terminateTask(taskId) {{
                     const pId = document.getElementById('project-id').value;
-                    await fetch(`/api/project/${{pId}}/task/${{taskId}}/terminate`, {{ method: 'POST' }});
+                    await fetch('/api/project/' + pId + '/task/' + taskId + '/terminate', {{ method: 'POST' }});
                     fetchPipeline();
+                    fetchCompletedPipeline();
                 }}
 
-                // Start Polling
+                // Start polling
                 fetchPipeline();
+                fetchCompletedPipeline();
                 setInterval(fetchPipeline, 3000);
+                setInterval(fetchCompletedPipeline, 5000);
             </script>
         </body>
     </html>

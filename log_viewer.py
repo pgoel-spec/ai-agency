@@ -1,73 +1,104 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
-from onboarding import get_layout_header, get_sidebar_html
+from onboarding import get_layout_header, get_sidebar_html, get_project_sidebar_html, get_vault
 from database import get_all_sessions, get_logs_by_ticket, get_logs_by_session
 
 router = APIRouter()
 
 @router.get("/logs", response_class=HTMLResponse)
-def view_all_logs():
+def view_all_logs(project: str = None):
     raw_data = get_all_sessions()
+    vault = get_vault()
     
-    # 1. Group the data by Ticket ID
+    # 1. Group the data by Workspace and Ticket ID combo
     tickets = {}
+    projects = set() # Track unique projects for the dropdown
+    
     for row in raw_data:
         t_id = row.get("ticket_id")
         s_id = row.get("session_id")
+        p_id = row.get("project_id")
         last_active = row.get("last_active")
         
-        if t_id not in tickets:
-            tickets[t_id] = {
+        # Resolve project name
+        p_name = vault.get(p_id, {}).get("project_name", "Unknown Project") if p_id else "Legacy Data"
+        if p_id:
+            projects.add((p_id, p_name))
+            
+        group_key = f"{p_name} | Ticket: {t_id}"
+        
+        if group_key not in tickets:
+            tickets[group_key] = {
+                "project_id": p_id or "unknown",
+                "ticket_id": t_id,
+                "display_title": f"Ticket: {t_id}", 
                 "last_active": last_active,
                 "sessions": []
             }
             
-        # Ensure the parent ticket reflects the absolute most recent activity
-        if last_active and last_active > tickets[t_id]["last_active"]:
-            tickets[t_id]["last_active"] = last_active
+        if last_active and last_active > tickets[group_key]["last_active"]:
+            tickets[group_key]["last_active"] = last_active
             
-        # Add the session if it exists (ignoring legacy NULLs for the sub-list)
         if s_id:
-            tickets[t_id]["sessions"].append({
+            tickets[group_key]["sessions"].append({
                 "session_id": s_id,
                 "last_active": last_active
             })
 
-    # Sort tickets by most recently active overall
-    sorted_tickets = sorted(tickets.items(), key=lambda x: x[1]["last_active"] or "", reverse=True)
+    sorted_tickets = sorted(tickets.values(), key=lambda x: x["last_active"] or "", reverse=True)
 
-    # 2. Build the HTML UI using shared layout components
+    # Build dropdown options
+    dropdown_options = ""
+    for pid, pname in sorted(list(projects), key=lambda x: x[1]):
+        dropdown_options += f'<option value="{pid}">{pname}</option>'
+
+    # 2. Determine which sidebar to show based on the URL parameter
+    if project and project in vault:
+        project_name = vault.get(project, {}).get("project_name", project)
+        sidebar_html = get_project_sidebar_html(project, project_name, "logs")
+    else:
+        sidebar_html = get_sidebar_html("logs")
+
     html_content = f"""
     <html>
         <head>
-            <title>AI Agency - Log Dashboard</title>
+            <title>AI Agency - Run History</title>
             <script src="https://cdn.tailwindcss.com"></script>
             <script>
-                tailwind.config = {{ 
-                    darkMode: 'class',
-                    theme: {{
-                        extend: {{
-                            colors: {{
-                                'log-bg': '#1e1e1e',
-                                'log-surface': '#252526',
-                                'log-border': '#333333',
-                                'log-text': '#d4d4d4'
-                            }}
-                        }}
-                    }}
-                }}
+                tailwind.config = {{ darkMode: 'class', theme: {{ extend: {{ colors: {{ 'log-bg': '#1e1e1e', 'log-surface': '#252526', 'log-border': '#333333', 'log-text': '#d4d4d4' }} }} }} }};
                 
-                // Instantly apply theme before page paint to prevent flicker
+                // Ensure night mode works properly on load
                 if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {{
                     document.documentElement.classList.add('dark');
                 }} else {{
                     document.documentElement.classList.remove('dark');
                 }}
                 
-                function toggleTheme() {{
-                    document.documentElement.classList.toggle('dark');
-                    localStorage.theme = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+                function filterLogs() {{
+                    const filterValue = document.getElementById('project-filter').value;
+                    const items = document.querySelectorAll('.log-item');
+                    items.forEach(item => {{
+                        if (filterValue === 'ALL' || item.getAttribute('data-project') === filterValue) {{
+                            item.style.display = 'block';
+                        }} else {{
+                            item.style.display = 'none';
+                        }}
+                    }});
                 }}
+
+                // Auto-filter based on URL parameter
+                window.addEventListener('DOMContentLoaded', () => {{
+                    const urlParams = new URLSearchParams(window.location.search);
+                    const projectId = urlParams.get('project');
+                    if (projectId) {{
+                        const select = document.getElementById('project-filter');
+                        // Ensure the option exists before setting it
+                        if ([...select.options].some(opt => opt.value === projectId)) {{
+                            select.value = projectId;
+                            filterLogs();
+                        }}
+                    }}
+                }});
             </script>
         </head>
         <body class="bg-gray-50 dark:bg-log-bg transition-colors duration-200 h-screen overflow-hidden flex flex-col">
@@ -75,21 +106,31 @@ def view_all_logs():
             {get_layout_header()}
 
             <div class="flex flex-1 overflow-hidden">
-                {get_sidebar_html("logs")}
+                
+                <!-- Dynamically injected Sidebar -->
+                {sidebar_html}
 
                 <div class="flex-1 overflow-y-auto p-8">
                     <div class="max-w-4xl mx-auto">
-                        <h1 class="text-2xl font-bold text-gray-900 dark:text-log-text mb-6 pb-4 border-b border-gray-200 dark:border-log-border">AI Run History</h1>
+                        <div class="flex justify-between items-center mb-6 pb-4 border-b border-gray-200 dark:border-log-border">
+                            <h1 class="text-2xl font-medium text-gray-900 dark:text-log-text">Run History</h1>
+                            <select id="project-filter" onchange="filterLogs()" class="bg-white dark:bg-log-surface text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-log-border rounded px-4 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 transition cursor-pointer">
+                                <option value="ALL">All Projects</option>
+                                {dropdown_options}
+                            </select>
+                        </div>
     """
     
     if not sorted_tickets:
         html_content += '<p class="text-gray-500 dark:text-gray-400">No logs found in the database.</p>'
     else:
-        for t_id, data in sorted_tickets:
+        for data in sorted_tickets:
+            p_id = data["project_id"]
+            t_id = data["ticket_id"]
             html_content += f"""
-                <div class="bg-white dark:bg-log-surface p-5 rounded-xl border border-gray-200 dark:border-log-border shadow-sm mb-4">
+                <div class="log-item bg-white dark:bg-log-surface p-5 rounded border border-gray-200 dark:border-log-border mb-4" data-project="{p_id}">
                     <div class="flex justify-between items-center mb-3">
-                        <a href="/logs/{t_id}" target="_blank" class="text-lg font-bold text-blue-600 dark:text-blue-400 hover:underline">Ticket: {t_id} (View All Logs)</a>
+                        <a href="/logs/{t_id}" target="_blank" class="text-lg font-medium text-gray-900 dark:text-gray-100 hover:text-blue-600 dark:hover:text-blue-400 hover:underline">{data["display_title"]}</a>
                         <span class="text-xs text-gray-500 dark:text-gray-400">Last updated: {data['last_active']}</span>
                     </div>
             """
@@ -100,7 +141,7 @@ def view_all_logs():
                     html_content += f"""
                         <div class="flex items-center text-sm">
                             <span class="text-gray-400 dark:text-gray-500 mr-2">↳</span>
-                            <a href="/logs/{t_id}/{s['session_id']}" target="_blank" class="text-emerald-600 dark:text-emerald-400 font-medium hover:underline mr-3">Session: {s['session_id']}</a>
+                            <a href="/logs/{t_id}/{s['session_id']}" target="_blank" class="text-gray-600 dark:text-gray-400 font-medium hover:text-blue-600 dark:hover:text-blue-400 hover:underline mr-3">Session: {s['session_id']}</a>
                             <span class="text-xs text-gray-400">({s['last_active']})</span>
                         </div>
                     """
@@ -272,7 +313,7 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                 .json-string {{ color: #d4d4d4; word-break: break-word; white-space: pre-wrap; flex: 1; min-width: 0; font-size: inherit; }}
                 .json-number {{ color: #d4d4d4; font-size: inherit; }}
                 .json-boolean {{ color: #d4d4d4; font-size: inherit; }}
-                .json-null {{ color: #aaa; font-style: italic; font-size: inherit; }}
+                .json-null {{ color: #aaa; font-size: inherit; }}
             </style>
         </head>
         <body>

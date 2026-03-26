@@ -51,7 +51,7 @@ def get_recent_linear_comments(ticket_id: str, linear_token: str) -> str:
         
     return "Could not fetch history."
 
-def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_config: dict):
+def process_ticket(task_id: str, ticket_id: str, current_session_id: str, project_id: str, human_input: str, tenant_config: dict):
     """
     Synchronous background task to run the AI team.
     FastAPI automatically runs standard 'def' background tasks in a separate thread pool,
@@ -111,7 +111,6 @@ def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_con
 
     config = {
         "configurable": {
-            "thread_id": ticket_id,
             "sandbox": workspace, # Pass the sandbox here, NOT in the state
             "tenant_config": tenant_config,
             "repo_root": repo_root,
@@ -126,12 +125,12 @@ def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_con
             agent_team = workflow.compile(checkpointer=memory)
 
             # Helper to avoid repeating logging logic 3 times
-            def stream_and_log(input_data, config, ticket_id, session_id):
+            def stream_and_log(input_data, config, ticket_id, current_session_id):
                 # --- STEP 1: Log the Input (What we are sending to the AI) ---
                 # We log the input_data so we know the exact state/prompt the AI received.
                 log_activity(
                     ticket_id=ticket_id,
-                    session_id=session_id,
+                    session_id=current_session_id,
                     project_id=project_id,
                     role="system_input", 
                     content=str(input_data), # This captures the prompt + state variables
@@ -144,7 +143,7 @@ def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_con
                         # This logs the moment a node emits ANY event, capturing the "Silence"
                         log_activity(
                             ticket_id=ticket_id,
-                            session_id=session_id,
+                            session_id=current_session_id,
                             project_id=project_id,
                             role="system_trace",
                             content=f"Node '{node_name}' activated and processing...",
@@ -160,7 +159,7 @@ def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_con
                                 # This captures metadata, thought signatures, and usage stats
                                 log_activity(
                                     ticket_id=ticket_id,
-                                    session_id=session_id,
+                                    session_id=current_session_id,
                                     project_id=project_id,
                                     role="ai_raw_response",
                                     content=last_msg.dict() if hasattr(last_msg, "dict") else str(last_msg),
@@ -172,7 +171,7 @@ def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_con
                                     for tc in last_msg.tool_calls:
                                         log_activity(
                                             ticket_id=ticket_id,
-                                            session_id=session_id,
+                                            session_id=current_session_id,
                                             project_id=project_id,
                                             role="ai_tool_call",
                                             content=tc["args"],
@@ -186,7 +185,7 @@ def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_con
                                 is_err = any(word in content_str for word in ["error", "failed", "exception", "not found"])
                                 log_activity(
                                     ticket_id=ticket_id,
-                                    session_id=session_id,
+                                    session_id=current_session_id,
                                     project_id=project_id,
                                     role="tool_output",
                                     content=last_msg.content,
@@ -197,7 +196,7 @@ def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_con
 
                             print(f"\n--- Update from {node_name} ---\n{last_msg.content}")
             
-            # Initial Log: Capture the starting human input
+            # --- THE STATEFUL RESUMPTION CHECK ---
             best_branch_info = get_best_resume_branch(
                 ticket_id=ticket_id, 
                 github_token=tenant_config.get("github_token"),
@@ -206,32 +205,40 @@ def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_con
             short_time = datetime.now().strftime("%b %d, %H:%M")
 
             if best_branch_info:
+                # PATH A: RESUME EXISTING WORK
                 branch_name = best_branch_info["branch_name"]
                 branch_type = best_branch_info["type"]
 
-                print(f"\n[SYSTEM]: Found '{branch_type}' branch at '{branch_name}'. Team will resume work from here.")
+                # Extract the old timestamp from the branch name (e.g. wip-ai-agency-ws-AI-6-1774207968 -> 1774207968)
+                old_session_id = branch_name.split("-")[-1]
+                print(f"\n[SYSTEM]: Found '{branch_type}' branch at '{branch_name}'. Team will resume memory from session {old_session_id}.")
 
-                # --- Extract the Session ID from the branch name ---
-                # If the branch is 'wip-recovery-123-17000', the session_id is '123-17000'
-                session_id = branch_name.replace("wip-recovery-", "").replace("feature-", "")
-
-                # --- Update Config to use the Shared Memory ID ---
-                config["configurable"]["thread_id"] = session_id
+                # --- Update Config to use the OLD Memory ID, but keep branches strictly named ---
+                active_memory_thread = f"{ticket_id}-{old_session_id}"
+                
+                config["configurable"]["thread_id"] = active_memory_thread
                 config["configurable"]["ticket_id"] = ticket_id
-                config["configurable"]["wip_branch"] = f"wip-recovery-{session_id}"
-                config["configurable"]["pr_branch"] = f"feature-{session_id}"
-                config["configurable"]["active_resume_branch"] = branch_name # So we know what to checkout
+                config["configurable"]["wip_branch"] = branch_name
+                config["configurable"]["pr_branch"] = branch_name if branch_type == "pr" else f"feature-{ticket_id}-{old_session_id}"
+                config["configurable"]["active_resume_branch"] = branch_name
+
+                # NATIVE GIT CHECKOUT: We do this in Python so the LLM doesn't hallucinate and branch off main.
+                try:
+                    workspace.commands.run(f"{export_prefix}cd '{repo_root}' && git fetch origin && git checkout {branch_name}")
+                    print(f"[SYSTEM]: Successfully checked out {branch_name} natively.")
+                except Exception as e:
+                    print(f"[SYSTEM ERROR]: Failed to checkout {branch_name}: {str(e)}")
 
                 # Add system override based on the branch type
                 if branch_type == "wip":
                     system_note = (
                         f"\n\nSYSTEM OVERRIDE: A WIP recovery branch exists at '{branch_name}'. "
-                        f"You MUST navigate into the repository folder (clone it first if missing) and run `git checkout {branch_name}` to recover your lost work before doing anything else."
+                        f"To recover your lost work, the system has AUTOMATICALLY checked out this branch for you. Continue your work on this branch."
                     )
                 else:
                     system_note = (
                         f"\n\nSYSTEM OVERRIDE: An open Pull Request already exists on branch '{branch_name}'. "
-                        f"To avoid merge conflicts, you MUST navigate into the repository folder (clone it first if missing) and run `git checkout {branch_name}` before doing anything else."
+                        f"To avoid merge conflicts, the system has AUTOMATICALLY checked out this branch for you. Apply any requested revisions directly to this branch."
                     )
                 
                 prompt = human_input + system_note
@@ -247,44 +254,45 @@ def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_con
                 current_state = agent_team.get_state(config)
                 has_history = bool(current_state.values)
 
+                # UI LOGGING: Always log using current_session_id so it shows on today's UI run!
                 # Log the webhook immediately so it appears at the top of the UI timeline, before the AI streams.
-                log_activity(ticket_id, "human", human_input, node_name="Webhook", session_id=session_id, project_id=project_id)
+                log_activity(ticket_id, "human", human_input, node_name="Webhook", session_id=current_session_id, project_id=project_id)
 
                 if has_history:
                     # --- WIP: CONTEXT REHYDRATION (Checking the Real World) ---
                     # recent_comments = get_recent_linear_comments(ticket_id)
 
-                    stream_and_log({"messages": [webhook_msg], "session_id": session_id}, config, ticket_id, session_id)
+                    stream_and_log({"messages": [webhook_msg], "session_id": current_session_id}, config, ticket_id, current_session_id)
                 else:
                     # Start a new conversation, but force it to use the PR branch
                     initial_state = {
                         "messages": [webhook_msg],
                         "active_ticket_url": ticket_id,
-                        "session_id": session_id,
+                        "session_id": current_session_id,
                         "project_id": project_id,
                         "current_status": "NOT_STARTED",
                         "current_phase": "Planning"
                     }
-                    stream_and_log(initial_state, config, ticket_id, session_id)
+                    stream_and_log(initial_state, config, ticket_id, current_session_id)
             else:
+                # PATH B: BRAND NEW WORK
                 print(f"\n[SYSTEM]: No active PR or WIP branches found ahead of main. Dispatching team for new ticket {ticket_id}...")
                 
-                # --- Generate a shared Session ID ---
-                session_timestamp = int(time.time())
-                session_id = f"{ticket_id}-{session_timestamp}"
+                # We use the current task_id (ticket_id + current timestamp) for everything
+                active_memory_thread = task_id
 
                 # Log the webhook immediately so it appears at the top of the UI timeline, before the AI streams.
-                log_activity(ticket_id, "human", human_input, node_name="Webhook", session_id=session_id, project_id=project_id)
+                log_activity(ticket_id, "human", human_input, node_name="Webhook", session_id=current_session_id, project_id=project_id)
 
                 # --- Set up the shared config ---
-                config["configurable"]["thread_id"] = session_id
+                config["configurable"]["thread_id"] = active_memory_thread
                 config["configurable"]["ticket_id"] = ticket_id
-                config["configurable"]["wip_branch"] = f"wip-recovery-{session_id}"
-                config["configurable"]["pr_branch"] = f"feature-{session_id}"
+                config["configurable"]["wip_branch"] = f"wip-{task_id}"
+                config["configurable"]["pr_branch"] = f"feature-{task_id}"
                 config["configurable"]["active_resume_branch"] = "main"
 
                 # If there's no open PR, we start entirely from scratch.
-                system_note = "\n\nSYSTEM OVERRIDE: You are in a completely new, empty E2B sandbox. There are no open PRs to resume from. Build the feature from scratch on a new branch."
+                system_note = "\n\nSYSTEM OVERRIDE: You are in a completely new, empty E2B sandbox. There are no open PRs. Build the feature from scratch on a new branch."
                 prompt = human_input + system_note
                 
                 # --- Create object so we don't lose timestamp ---
@@ -297,7 +305,7 @@ def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_con
                 initial_state = {
                     "messages": [webhook_msg],
                     "active_ticket_url": ticket_id,
-                    "session_id": session_id,
+                    "session_id": current_session_id,
                     "current_status": "NOT_STARTED",
                     "current_phase": "Planning"
                 }
@@ -310,38 +318,42 @@ def process_ticket(ticket_id: str, project_id: str, human_input: str, tenant_con
                 # The AI will have no context of previous failures on this ticket.
                 # This ensures a clean slate for the new sandbox environment.
                 # ==========================================
-                stream_and_log(initial_state, config, ticket_id, session_id)
+                stream_and_log(initial_state, config, ticket_id, current_session_id)
     
     finally:
         # Always clean up the sandbox to save compute!
         workspace.kill()
 
-def run_pipeline_task(session_id: str, project_id: str, human_input: str, tenant_config: dict):
+def run_pipeline_task(task_id: str, project_id: str, human_input: str, tenant_config: dict):
     """
     Standard background task (synchronous) wrapper.
-    It manages the SQLite queue state and calls the execution engine directly.
+    It parses the IDs, manages the SQLite queue, and calls the execution engine.
     """
-    # 1. Mark task as Running
+    # 1. Split the task_id (e.g., ai-agency-ws-AI-6-1774207968)
+    parts = task_id.split("-")
+    current_session_id = parts[-1]                 
+    ticket_id = "-".join(parts[:-1])               
+
+    # 2. Mark task as Running
     with sqlite3.connect(PIPELINE_DB_PATH) as conn:
         conn.execute("UPDATE tasks SET status = 'Running', updated_at = ? WHERE task_id = ?", 
-                     (datetime.utcnow().isoformat(), session_id))
+                     (datetime.utcnow().isoformat(), task_id))
         conn.commit()
     
     try:
-        # 2. Execute your actual LangGraph agent
-        # Notice we removed "with_lock" because the SQLite DB handles our concurrency now
-        process_ticket(session_id, project_id, human_input, tenant_config)
+        # 3. Execute LangGraph agent with the parsed IDs
+        process_ticket(task_id, ticket_id, current_session_id, project_id, human_input, tenant_config)
         
-        # 3. If it finishes without crashing, mark as Completed
+        # 4. If it finishes without crashing, mark as Completed
         with sqlite3.connect(PIPELINE_DB_PATH) as conn:
             conn.execute("UPDATE tasks SET status = 'Completed', updated_at = ? WHERE task_id = ?", 
-                         (datetime.utcnow().isoformat(), session_id))
+                         (datetime.utcnow().isoformat(), task_id))
             conn.commit()
             
     except Exception as e:
-        print(f"\n[PIPELINE ERROR] Task {session_id} crashed: {str(e)}")
-        # 4. If it crashes (e.g. Git error, LLM limit), mark as Failed so the user can retry
+        print(f"\n[PIPELINE ERROR] Task {task_id} crashed: {str(e)}")
+        # 5. If it crashes, mark as Failed
         with sqlite3.connect(PIPELINE_DB_PATH) as conn:
             conn.execute("UPDATE tasks SET status = 'Failed', updated_at = ? WHERE task_id = ?", 
-                         (datetime.utcnow().isoformat(), session_id))
+                         (datetime.utcnow().isoformat(), task_id))
             conn.commit()

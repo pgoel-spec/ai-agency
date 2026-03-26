@@ -1,6 +1,7 @@
 import httpx
 import asyncio
 import sqlite3
+import time
 import re
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -133,20 +134,26 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
     if not tenant_config.get("is_active", True):
         return {"status": "Ignored", "message": "Project is currently paused or missing."}
 
-    # --- 2. Extract the globally unique, human-readable Session ID ---
+    # --- 2. Extract and define the exact Nomenclature IDs ---
     url = payload.get("url", "")
     match = re.search(r'https://linear\.app/([^/]+)/issue/([A-Za-z]+-\d+)', url)
     
     if match:
         workspace_slug = match.group(1)
         short_ticket_id = match.group(2).upper()
-        # Boom! Globally unique AND completely human-readable!
-        session_id = f"{workspace_slug}-{short_ticket_id}"
+        # BASE: Globally unique issue identifier (e.g., ai-agency-ws-AI-6)
+        ticket_id = f"{workspace_slug}-{short_ticket_id}"
     else:
         # Ultimate fallback to the long UUID just in case the URL format is weird
-        session_id = payload.get("data", {}).get("issueId") or payload.get("data", {}).get("id")
+        ticket_id = payload.get("data", {}).get("issueId") or payload.get("data", {}).get("id")
 
-    print(f"\n[DEBUG] Starting LangGraph Session -> {session_id}")
+    # SUFFIX: The specific timestamp for this execution attempt (e.g., 1774207968)
+    session_id = str(int(time.time()))
+    
+    # UNIQUE KEY: The exact DB entry and log file name (e.g., ai-agency-ws-AI-6-1774207968)
+    task_id = f"{ticket_id}-{session_id}"
+
+    print(f"\n[DEBUG] Webhook triggered for Ticket: {ticket_id} | Spawning Task: {task_id}")
     
     # --- 3. Intelligently parse the human input ---
     webhook_type = payload.get("type", "Issue")
@@ -161,42 +168,43 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
         human_input = (
             f"New Task Assigned: {ticket_title}\n\n"
             f"Description: {ticket_description}\n\n"
-            f"IMPORTANT: The active Linear Ticket ID for this task is {session_id}.\n"
+            f"IMPORTANT: The active Linear Ticket ID for this task is {ticket_id}.\n"
             f"IMPORTANT: Do not guess or invent a repository URL. Use the environment variable $GITHUB_REPO.\n"
         )
 
-    # --- 4. PIPELINE QUEUE: Insert or Update the Database ---
+    # --- 4. PIPELINE QUEUE: Insert the Database Row ---
     now = datetime.utcnow().isoformat()
     with sqlite3.connect(PIPELINE_DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT status FROM tasks WHERE task_id = ?", (session_id,))
+        
+        # Check for concurrency using the base ticket_id
+        # We look for the most recent task run for THIS specific ticket
+        cursor.execute(
+            "SELECT status FROM tasks WHERE task_id LIKE ? ORDER BY created_at DESC LIMIT 1", 
+            (f"{ticket_id}-%",)
+        )
         row = cursor.fetchone()
         
         if row:
             current_status = row[0]
-            # Prevent concurrent runs
-            if current_status in ["Pending", "Running"]:
+            # Prevent concurrent runs ONLY if the AI is actively executing.
+            if current_status == "Running":
                 return {
                     "status": "Ignored",
-                    "message": f"This task is currently {current_status}. Wait for it to finish.",
-                    "ticket": session_id
+                    "message": "This task is currently Running. Wait for it to finish.",
+                    "ticket": ticket_id
                 }
-            else:
-                # If it previously Failed or Completed, and we got a NEW webhook (like a new comment),
-                # we reset it back to Pending and update the prompt with the new comment!
-                cursor.execute(
-                    "UPDATE tasks SET status = 'Pending', human_input = ?, updated_at = ? WHERE task_id = ?",
-                    (human_input, now, session_id)
-                )
-        else:
-            # Brand new task, insert it
-            cursor.execute(
-                "INSERT INTO tasks (task_id, project_id, status, human_input, created_at, updated_at) VALUES (?, ?, 'Pending', ?, ?, ?)",
-                (session_id, project_id, human_input, now, now)
-            )
+        
+        # If no task is running, we insert a BRAND NEW row for this specific run.
+        # This prevents us from overwriting old logs if the user comments on a completed ticket!
+        cursor.execute(
+            "INSERT INTO tasks (task_id, project_id, status, human_input, created_at, updated_at) VALUES (?, ?, 'Pending', ?, ?, ?)",
+            (task_id, project_id, human_input, now, now)
+        )
         conn.commit()
 
     # --- 5. DISPATCH: Send it to our new persistent wrapper ---
-    background_tasks.add_task(run_pipeline_task, session_id, project_id, human_input, tenant_config)
+    # We pass 'task_id' so the engine knows exactly which DB row and log file to use!
+    background_tasks.add_task(run_pipeline_task, task_id, project_id, human_input, tenant_config)
 
-    return {"status": "Task queued in persistent pipeline", "ticket": session_id}
+    return {"status": "Task queued in persistent pipeline", "ticket": ticket_id, "task": task_id}

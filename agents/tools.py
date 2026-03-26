@@ -116,9 +116,13 @@ def get_wip_branch(ticket_id: str, github_token: str = None, repo_full: str = No
         
     branches = resp.json()
     
-    # Filter for WIP branches belonging to this ticket
-    wip_prefix = f"wip-recovery-{ticket_id}"
-    matching_branches = [b for b in branches if wip_prefix.lower() in b["name"].lower()]
+    # --- Look for the new 'wip-{ticket_id}' prefix ---
+    # (We also include the old 'wip-recovery' prefix to safely catch any in-flight branches)
+    matching_branches = [
+        b for b in branches 
+        if f"wip-{ticket_id}".lower() in b["name"].lower() 
+        or f"wip-recovery-{ticket_id}".lower() in b["name"].lower()
+    ]
     
     if not matching_branches:
         return None
@@ -353,9 +357,15 @@ def update_linear_ticket(message: str, config: RunnableConfig) -> str:
         # Return a soft warning instead of an Error so the AI can gracefully proceed to FINISH
         return "Warning: Linear integration is missing or disconnected. Ticket update skipped."
 
+    # Dynamically format the header
+    if linear_token.startswith("lin_api_"):
+        auth_header = linear_token
+    else:
+        auth_header = f"Bearer {linear_token}" # OAuth tokens require the Bearer prefix
+
     url = "https://api.linear.app/graphql"
     headers = {
-        "Authorization": f"Bearer {linear_token}", # OAuth tokens require the Bearer prefix
+        "Authorization": auth_header, 
         "Content-Type": "application/json",
     }
     
@@ -404,7 +414,6 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
         "GITHUB_REPO": repo_full
     }
 
-    repo_folder = repo_full.split("/")[-1].replace(".git", "")
     repo_root = config.get("configurable", {}).get("repo_root", ".")
 
     # This calls the same function that main.py uses to check for PRs
@@ -512,9 +521,6 @@ def sync_wip_commit(thought: str, commit_message: str, config: RunnableConfig) -
     if not github_token or not repo_full:
         return "Error: Missing GITHUB_TOKEN or GITHUB_REPO in tenant configuration."
 
-    # Extract repo folder
-    repo_folder = repo_full.split("/")[-1].replace(".git", "")
-    
     repo_root = config.get("configurable", {}).get("repo_root", ".")
 
     # The script uses HEAD:refs/heads/... to push the current state to the remote WIP branch
@@ -565,7 +571,7 @@ def manage_dev_server(thought: str, action: str, command: str, config: RunnableC
         repo_root = config.get("configurable", {}).get("repo_root", ".")
 
         # Clean up old state first
-        workspace.commands.run(f"rm {log_file} {pid_file} || echo 'clean'")
+        workspace.commands.run(f"rm -f {log_file} {pid_file}")
 
         try:
             # Force write the initial line BEFORE starting the server
@@ -575,30 +581,29 @@ def manage_dev_server(thought: str, action: str, command: str, config: RunnableC
             cd_cmd = f"cd $(find '{repo_root}' -maxdepth 3 -name firebase.json -printf '%h\\n' | head -n 1) || cd '{repo_root}'"
             
             # Native E2B background execution.
-            # We must manually redirect stdout/stderr to a file within the command if we want to read the logs later.
-            # Use '>>' to APPEND to the log file so we don't erase the line we just wrote
             # Group the commands inside { } so that ALL output (even from the cd command) is captured in the log file.
             secure_command = f"{{ {export_prefix}{cd_cmd} && {command}; }} >> {log_file} 2>&1"
             
-            # Inject only THIS client's secrets
+            # Inject only THIS client's secrets and use 'setsid' to create a new Process Group
             process = workspace.commands.run(
-                f"bash -c {shlex.quote(secure_command)}", 
+                f"setsid bash -c {shlex.quote(secure_command)}", 
                 background=True,
             )
             
-            # Record the PID
+            # Record the PID (which acts as the Process Group ID)
             workspace.files.write(pid_file, str(process.pid))
             
             # Synchronous Polling Loop
-            print(f"[SYSTEM] Waiting for server (PID {process.pid}) to boot...")
+            print(f"[SYSTEM] Waiting for server (PGID {process.pid}) to boot...")
             max_wait_time = 30
             booted = False
             
             for _ in range(max_wait_time // 2):
                 time.sleep(2) # Pause the Python thread, delaying the LLM's next turn
                 
-                # 1. LOGICAL LIVENESS CHECK: Did the background process die unexpectedly?
-                is_alive_check = workspace.commands.run(f"kill -0 $(cat {pid_file} 2>/dev/null) 2>/dev/null")
+                # 1. LOGICAL LIVENESS CHECK: Did the background process group die unexpectedly?
+                # The minus sign (-) targets the entire process group
+                is_alive_check = workspace.commands.run(f"kill -0 -$(cat {pid_file} 2>/dev/null) 2>/dev/null")
                 if is_alive_check.exit_code != 0:
                     break # Process crashed, break immediately to report the error
 
@@ -645,48 +650,29 @@ def manage_dev_server(thought: str, action: str, command: str, config: RunnableC
         return f"Server Logs:\n{res.stdout or res.stderr}"
         
     elif action == "stop":
-        repo_root = config.get("configurable", {}).get("repo_root", ".")
-
         cleanup_cmd = f"""
-        echo "Stopping parent process recorded in {pid_file}..."
-        PID=$(cat {pid_file} || echo "")
-        if [ ! -z "$PID" ]; then kill -15 $PID || kill -9 $PID || echo "PID dead"; fi
-        
-        echo "Dynamically finding and freeing Firebase ports..."
-        
-        # 1. Define standard default Firebase ports
-        PORTS="4000 4400 4500 5000 5001 8080 8081 8085 9000 9099 9199"
-        
-        # 2. Intelligently extract ANY custom ports the AI configured in firebase.json
-        FIREBASE_JSON=$(find '{repo_root}' -maxdepth 3 -name firebase.json -print -quit)
-        if [ ! -z "$FIREBASE_JSON" ]; then
-            # Uses grep to find all port numbers defined in the JSON
-            CUSTOM_PORTS=$(grep -o '"port": *[0-9]*' "$FIREBASE_JSON" | grep -o '[0-9]*')
-            PORTS="$PORTS $CUSTOM_PORTS"
+        if [ -f "{pid_file}" ]; then
+            PGID=$(cat "{pid_file}")
+            if [ -n "$PGID" ]; then
+                echo "Terminating Process Group: $PGID"
+                # The minus sign (-$PGID) sends the signal to the ENTIRE process tree.
+                # This guarantees all child nodes and emulators drop their ports instantly.
+                kill -15 -$PGID 2>/dev/null || true
+                sleep 1
+                kill -9 -$PGID 2>/dev/null || true
+            fi
+            rm -f "{pid_file}" "{log_file}"
+        else
+            echo "No active server found."
         fi
-
-        echo "Cleaning up Firebase processes..."
-        pkill -f "firebase" || true
-        
-        # 3. Use fuser to find processes on these ports and kill them gracefully
-        for PORT in $PORTS; do
-            # -15 sends SIGTERM (graceful shutdown)
-            fuser -k -15 ${{PORT}}/tcp 2>/dev/null || true
-        done
-        
-        sleep 1 # Give the emulators a second to cleanly close their local databases
-        
-        # 4. Force kill anything that refused to shut down
-        for PORT in $PORTS; do
-            # -9 sends SIGKILL (force shutdown)
-            fuser -k -9 ${{PORT}}/tcp 2>/dev/null || true
-        done
-        
-        rm -f {pid_file} {log_file}
-        echo "Server and all related ports successfully freed."
+        exit 0
         """
-        workspace.commands.run(f"bash -c {shlex.quote(cleanup_cmd)}")
-        return "Server and all related ports dynamically found and stopped."
+        
+        try:
+            workspace.commands.run(f"bash -c {shlex.quote(cleanup_cmd)}")
+            return "Server and all child processes successfully terminated. Ports freed."
+        except Exception as e:
+            return f"Failed to stop server cleanly: {str(e)}"
     
     return "Invalid action."
 

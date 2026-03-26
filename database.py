@@ -124,7 +124,7 @@ def get_all_sessions():
         
         # We fetch everything, grouping by both so we know exactly which sessions belong to which tickets
         cursor.execute('''
-            SELECT ticket_id, session_id, MAX(timestamp) as last_active
+            SELECT ticket_id, session_id, MAX(project_id) as project_id, MAX(timestamp) as last_active
             FROM activity_logs 
             WHERE ticket_id IS NOT NULL
             GROUP BY ticket_id, session_id
@@ -188,4 +188,17 @@ def get_sessions_by_project(project_id: str):
             GROUP BY ticket_id, session_id
             ORDER BY last_active DESC
         ''', (project_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+def get_completed_tasks(project_id: str):
+    """Fetches all tasks that have finished or been dismissed."""
+    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT * FROM tasks 
+               WHERE project_id = ? AND status IN ('Completed', 'Terminated') 
+               ORDER BY updated_at DESC""",
+            (project_id,)
+        )
         return [dict(row) for row in cursor.fetchall()]
