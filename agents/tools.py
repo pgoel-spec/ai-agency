@@ -349,6 +349,8 @@ def update_linear_ticket(message: str, config: RunnableConfig) -> str:
     if not ticket_id:
         return "Error: System failed to inject the active ticket ID."
     
+    linear_issue_id = ticket_id.split("_")[-1] if "_" in ticket_id else ticket_id
+    
     tenant_config = config.get("configurable", {}).get("tenant_config", {})
     # Intelligently support BOTH the new OAuth token and the legacy API key
     linear_token = tenant_config.get("linear_access_token") or tenant_config.get("linear_api_key") or os.environ.get("LINEAR_API_KEY")
@@ -380,12 +382,12 @@ def update_linear_ticket(message: str, config: RunnableConfig) -> str:
     
     response = requests.post(
         url, 
-        json={"query": query, "variables": {"issueId": ticket_id, "body": message}}, 
+        json={"query": query, "variables": {"issueId": linear_issue_id, "body": message}}, 
         headers=headers
     )
     
     if response.status_code == 200 and "errors" not in response.json():
-        return f"Successfully posted update to ticket {ticket_id}"
+        return f"Successfully posted update to ticket {linear_issue_id}"
     return f"Failed to update ticket: {response.text}"
 
 @tool(args_schema=GitHubPRInput)

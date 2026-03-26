@@ -75,6 +75,17 @@ async def handle_preview_ready(payload: PreviewPayload):
     if not linear_token:
         return {"error": "No Linear token found for tenant"}
 
+    # Parse using the underscore
+    if "_" in payload.ticket_id:
+        # Splits "feature-ai-agency-ws_AI-6-1774207968" -> "AI-6-1774207968"
+        after_underscore = payload.ticket_id.split("_")[-1] 
+        parts = after_underscore.split("-")
+        
+        # Rejoin just the "AI" and "6"
+        linear_issue_id = f"{parts[0]}-{parts[1]}" if len(parts) >= 2 else after_underscore
+    else:
+        linear_issue_id = payload.ticket_id
+
     # 2. Construct the GraphQL mutation for Linear
     graphql_query = """
     mutation commentCreate($issueId: String!, $body: String!) {
@@ -84,7 +95,7 @@ async def handle_preview_ready(payload: PreviewPayload):
     }
     """
     variables = {
-        "issueId": payload.ticket_id,
+        "issueId": linear_issue_id,
         "body": f"🚀 **Live Preview Ready:** {payload.preview_url}\n\n*Deployed automatically by AI Agency Developer.*"
     }
 
@@ -142,7 +153,7 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
         workspace_slug = match.group(1)
         short_ticket_id = match.group(2).upper()
         # BASE: Globally unique issue identifier (e.g., ai-agency-ws-AI-6)
-        ticket_id = f"{workspace_slug}-{short_ticket_id}"
+        ticket_id = f"{workspace_slug}_{short_ticket_id}"
     else:
         # Ultimate fallback to the long UUID just in case the URL format is weird
         ticket_id = payload.get("data", {}).get("issueId") or payload.get("data", {}).get("id")

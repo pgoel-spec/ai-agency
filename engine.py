@@ -35,9 +35,11 @@ def get_recent_linear_comments(ticket_id: str, linear_token: str) -> str:
     }
     """
     
+    linear_issue_id = ticket_id.split("_")[-1] if "_" in ticket_id else ticket_id
+
     response = requests.post(
-        url, 
-        json={"query": query, "variables": {"id": ticket_id}}, 
+        url,
+        json={"query": query, "variables": {"id": linear_issue_id}},
         headers=headers
     )
     

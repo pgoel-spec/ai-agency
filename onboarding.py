@@ -714,7 +714,7 @@ def admin_dashboard():
 def install_linear(project_id: str):
     client_id = os.getenv("LINEAR_CLIENT_ID")
     redirect_uri = os.getenv("LINEAR_REDIRECT_URI")
-    url = f"https://linear.app/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope=read,write,issues:create,comments:create,admin&state={project_id}&prompt=consent"
+    url = f"https://linear.app/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope=read,write,issues:create,comments:create&state={project_id}&prompt=consent&actor=app"
     return RedirectResponse(url=url)
 
 @router.get("/auth/linear/callback", response_class=HTMLResponse)
