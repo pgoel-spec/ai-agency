@@ -11,6 +11,7 @@ from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from langchain_tavily import TavilySearch
 import shlex
+import json
 
 # Create schemas to hide the 'workspace' parameter from the LLM
 class TerminalInput(BaseModel):
@@ -45,16 +46,6 @@ class GitHubPRInput(BaseModel):
     pr_title: str = Field(description="PR Title")
     pr_body: str = Field(description="PR Body")
 
-class ManageDevServerInput(BaseModel):
-    thought: str = Field(description="Your reasoning for why you are starting, stopping, or checking logs.")
-    action: str = Field(description="'start', 'logs', or 'stop'")
-    command: str = Field(description="The server command (e.g., 'npm run dev'). Only needed for 'start'.", default="")
-
-class InspectFrontendInput(BaseModel):
-    thought: str = Field(description="Explain what you expect to see or test by inspecting the frontend.")
-    url: str = Field(description="The local URL to inspect, e.g. http://localhost:5000")
-    wait_for_selector: str = Field(description="Optional. A specific CSS selector to wait for before inspecting the console (e.g., '.news-item'). Use this if your code fetches data asynchronously.", default="")
-
 # Add this schema near your other Input schemas at the top of the file
 class WebSearchInput(BaseModel):
     thought: str = Field(description="Explain what error or concept you are researching.")
@@ -63,6 +54,407 @@ class WebSearchInput(BaseModel):
 class GenerateRepoMapInput(BaseModel):
     thought: str = Field(description="Confirm that you are mapping the repo to understand the architecture before writing code.")
     target_dir: str = Field(description="The directory to map. Leave as '.' to use the default repository.")
+
+import json # Ensure this is imported at the top!
+
+class RunUnitTestsInput(BaseModel):
+    thought: str = Field(description="Your reasoning for running these specific unit tests.")
+    test_command: str = Field(description="The command to run tests (e.g., 'npm test' or 'npx jest').", default="npm test")
+
+class RunBackendTestInput(BaseModel):
+    thought: str = Field(description="Your logical reasoning...")
+    test_command: str = Field(description="The terminal command to execute your test script (e.g., 'node tests/api.test.js' or 'pytest'). You MUST use write_file to create this test script before calling this tool.")
+
+class RunFrontendTestInput(BaseModel):
+    thought: str = Field(description="Your reasoning for what frontend behavior you are testing.")
+    url_path: str = Field(description="The relative URL path to test (e.g., '/' or '/snake').")
+    wait_for_selector: str = Field(description="Optional CSS selector to wait for before inspecting the console.", default="")
+
+@tool(args_schema=RunUnitTestsInput)
+def run_unit_tests(thought: str, test_command: str, config: RunnableConfig) -> str:
+    """Runs isolated unit tests without booting a dev server."""
+    workspace = config.get("configurable", {}).get("sandbox")
+    repo_root = config.get("configurable", {}).get("repo_root", ".")
+    export_prefix = config.get("configurable", {}).get("export_prefix", "")
+
+    if not workspace: return "Error: No active sandbox."
+    
+    try:
+        # Auto-heal dependencies silently if missing
+        workspace.commands.run(f"cd '{repo_root}' && [ ! -d 'node_modules' ] && npm install --no-audit --no-fund")
+        
+        execution = workspace.commands.run(f"cd '{repo_root}' && {export_prefix} {test_command}")
+        return f"UNIT TEST RESULTS:\nSTDOUT:\n{execution.stdout}\nSTDERR:\n{execution.stderr}"
+    except Exception as e:
+        return f"Failed to execute tests: {str(e)}"
+
+@tool(args_schema=RunBackendTestInput)
+def run_backend_test(thought: str, test_command: str, config: RunnableConfig) -> str:
+    """Deterministically boots the environment, executes a custom test command you provide, and safely cleans up. You MUST write an integration test script (e.g., tests/api.test.js using fetch) via write_file before calling this."""
+    workspace = config.get("configurable", {}).get("sandbox")
+    repo_root = config.get("configurable", {}).get("repo_root", ".")
+    export_prefix = config.get("configurable", {}).get("export_prefix", "")
+    
+    if not workspace: return "Error: No active sandbox."
+
+    runner_path = f"/tmp/test_runner_{int(time.time())}.js"
+    
+    node_runner_script = r"""
+    const { execSync, spawn } = require('child_process');
+    const http = require('http');
+    const fs = require('fs');
+    const path = require('path');
+
+    const REPO_ROOT = __REPO_ROOT__;
+    const TEST_COMMAND = __TEST_COMMAND__;
+    const PORT = 5000;
+
+    function healDependencies() {
+        console.log('[SYSTEM] Scanning for missing dependencies...');
+        const findCmd = `find '${REPO_ROOT}' -name "node_modules" -prune -o -name "package.json" -print`;
+        try {
+            const files = execSync(findCmd, { encoding: 'utf-8' }).split(/\r?\n/).filter(Boolean);
+            for (const file of files) {
+                const dir = path.dirname(file);
+                if (!fs.existsSync(path.join(dir, 'node_modules'))) {
+                    console.log(`[SYSTEM] Installing missing dependencies in ${dir}...`);
+                    try {
+                        execSync('npm install --no-audit --no-fund', { cwd: dir, stdio: 'pipe' });
+                        console.log(`[SYSTEM] Successfully installed dependencies in ${dir}.`);
+                    } catch (npmError) {
+                        console.error('\n[CRITICAL] npm install failed in ' + dir + '!');
+                        console.error('=== NPM LOGS ===\n' + (npmError.stderr ? npmError.stderr.toString() : npmError.message));
+                        process.exit(1);
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('[SYSTEM] Dependency check script failed:', e.message);
+        }
+    }
+
+    // DETERMINISTIC LOG PROBING
+    function waitForEnvironment(serverProcess, port, timeoutMs = 45000) {
+        return new Promise((resolve) => {
+            let isResolved = false;
+            let logs = '';
+            
+            const finish = (status) => {
+                if (!isResolved) {
+                    isResolved = true;
+                    resolve(status);
+                }
+            };
+
+            const timeout = setTimeout(() => finish(false), timeoutMs);
+
+            // 1. Log-Based Probing (Instant & Deterministic for Firebase)
+            const checkLogs = (data) => {
+                if (isResolved) return;
+                logs += data.toString();
+                
+                if (logs.includes('All emulators ready')) {
+                    clearTimeout(timeout);
+                    finish(true);
+                }
+            };
+            
+            serverProcess.stdout.on('data', checkLogs);
+            serverProcess.stderr.on('data', checkLogs);
+
+            // 2. Port Polling Fallback (For generic Node.js/Express apps)
+            const interval = setInterval(() => {
+                if (isResolved) return clearInterval(interval);
+                http.get(`http://127.0.0.1:${port}/`, () => {
+                    if (!logs.includes('firebase')) {
+                        clearTimeout(timeout);
+                        clearInterval(interval);
+                        finish(true);
+                    }
+                }).on('error', () => {});
+            }, 2000);
+        });
+    }
+
+    async function main() {
+        try { execSync('fuser -k -9 5000/tcp 5001/tcp 5002/tcp 5003/tcp 2>/dev/null'); } catch(e) {}
+
+        healDependencies();
+
+        let firebaseDir = REPO_ROOT;
+        try {
+            const fbPath = execSync(`find '${REPO_ROOT}' -maxdepth 3 -name firebase.json | head -n 1`, { encoding: 'utf-8' }).trim();
+            if (fbPath) firebaseDir = path.dirname(fbPath);
+        } catch (e) {}
+
+        console.log(`[SYSTEM] Booting server in ${firebaseDir}...`);
+        
+        const serverProcess = spawn('npx', ['firebase', 'emulators:start'], { 
+            cwd: firebaseDir,
+            detached: true 
+        });
+
+        let serverLogs = '';
+        serverProcess.stdout.on('data', d => serverLogs += d.toString());
+        serverProcess.stderr.on('data', d => serverLogs += d.toString());
+
+        const isReady = await waitForEnvironment(serverProcess, PORT);
+
+        if (!isReady) {
+            console.log(`\n[CRITICAL] Server failed to boot or bind to port ${PORT} within 45 seconds.`);
+            console.log(`=== SERVER BOOT LOGS ===\n${serverLogs.slice(-2500)}`);
+            try { process.kill(-serverProcess.pid, 'SIGKILL'); } catch(e) {}
+            process.exit(1);
+        } else {
+            console.log(`[SYSTEM] Environment ready. Executing test command: ${TEST_COMMAND}\n`);
+            
+            try {
+                // Execute the AI's custom test script
+                const testOutput = execSync(TEST_COMMAND, { cwd: REPO_ROOT, encoding: 'utf-8', stdio: 'pipe' });
+                console.log('=== TEST PASSED ===\n' + testOutput);
+            } catch (testError) {
+                // If the AI's test script crashes (Exit code 1), bubble up the native stack trace AND the backend logs!
+                console.log('=== TEST FAILED ===');
+                if (testError.stdout) console.log(testError.stdout.toString());
+                if (testError.stderr) console.log(testError.stderr.toString());
+                
+                console.log('\n=== BACKEND SERVER LOGS (Diagnostic) ===\n' + serverLogs.slice(-2500));
+            }
+        }
+
+        try { process.kill(-serverProcess.pid, 'SIGTERM'); } catch(e) {}
+        setTimeout(() => {
+            try { execSync('fuser -k -9 5000/tcp 5001/tcp 5002/tcp 5003/tcp 2>/dev/null'); } catch(e) {}
+            process.exit(0);
+        }, 1000);
+    }
+
+    main();
+    """
+
+    node_runner_script = node_runner_script.replace("__REPO_ROOT__", json.dumps(repo_root))
+    node_runner_script = node_runner_script.replace("__TEST_COMMAND__", json.dumps(test_command))
+
+    try:
+        workspace.files.write(runner_path, node_runner_script)
+        result = workspace.commands.run(f"{export_prefix} node {runner_path}")
+        workspace.commands.run(f"rm -f {runner_path}")
+        return result.stdout or result.stderr
+    except Exception as e:
+        return f"CRITICAL TOOL EXCEPTION: {str(e)}\n\n(Note to AI: The testing orchestrator crashed. Check system state.)"
+
+@tool(args_schema=RunFrontendTestInput)
+def run_frontend_test(thought: str, url_path: str, config: RunnableConfig, wait_for_selector: str = "") -> str:
+    """Deterministically boots the environment, runs Playwright, and safely cleans up."""
+    workspace = config.get("configurable", {}).get("sandbox")
+    repo_root = config.get("configurable", {}).get("repo_root", ".")
+    export_prefix = config.get("configurable", {}).get("export_prefix", "")
+
+    if not workspace: return "Error: No active sandbox."
+
+    runner_path = f"/tmp/frontend_runner_{int(time.time())}.js"
+
+    node_runner_script = r"""
+    const { execSync, spawn } = require('child_process');
+    const http = require('http');
+    const fs = require('fs');
+    const path = require('path');
+    const { chromium } = require('playwright');
+
+    const REPO_ROOT = __REPO_ROOT__;
+    const TARGET_URL_PATH = __TARGET_URL_PATH__;
+    const TARGET_SELECTOR = __TARGET_SELECTOR__;
+    const PORT = 5000;
+    const TARGET_URL = `http://127.0.0.1:${PORT}${TARGET_URL_PATH}`;
+
+    function healDependencies() {
+        console.log('[SYSTEM] Scanning for missing dependencies...');
+        const findCmd = `find '${REPO_ROOT}' -name "node_modules" -prune -o -name "package.json" -print`;
+        try {
+            const files = execSync(findCmd, { encoding: 'utf-8' }).split(/\r?\n/).filter(Boolean);
+            for (const file of files) {
+                const dir = path.dirname(file);
+                if (!fs.existsSync(path.join(dir, 'node_modules'))) {
+                    console.log(`[SYSTEM] Installing missing dependencies in ${dir}...`);
+                    try {
+                        execSync('npm install --no-audit --no-fund', { cwd: dir, stdio: 'pipe' });
+                        console.log(`[SYSTEM] Successfully installed dependencies in ${dir}.`);
+                    } catch (npmError) {
+                        console.error('\n[CRITICAL] npm install failed in ' + dir + '!');
+                        console.error('=== NPM LOGS ===\n' + (npmError.stderr ? npmError.stderr.toString() : npmError.message));
+                        process.exit(1);
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('[SYSTEM] Dependency check script failed:', e.message);
+        }
+    }
+
+    // DETERMINISTIC LOG PROBING
+    function waitForEnvironment(serverProcess, port, timeoutMs = 45000) {
+        return new Promise((resolve) => {
+            let isResolved = false;
+            let logs = '';
+            
+            const finish = (status) => {
+                if (!isResolved) {
+                    isResolved = true;
+                    resolve(status);
+                }
+            };
+
+            const timeout = setTimeout(() => finish(false), timeoutMs);
+
+            // 1. Log-Based Probing (Instant & Deterministic for Firebase)
+            const checkLogs = (data) => {
+                if (isResolved) return;
+                logs += data.toString();
+                
+                // Resolves the exact millisecond Firebase finishes mounting background functions
+                if (logs.includes('All emulators ready')) {
+                    clearTimeout(timeout);
+                    finish(true);
+                }
+            };
+            
+            serverProcess.stdout.on('data', checkLogs);
+            serverProcess.stderr.on('data', checkLogs);
+
+            // 2. Port Polling Fallback (For generic Node.js/Express apps)
+            const interval = setInterval(() => {
+                if (isResolved) return clearInterval(interval);
+                http.get(`http://127.0.0.1:${port}/`, () => {
+                    // Only fallback to port-trusting if we aren't booting Firebase
+                    if (!logs.includes('firebase')) {
+                        clearTimeout(timeout);
+                        clearInterval(interval);
+                        finish(true);
+                    }
+                }).on('error', () => {});
+            }, 2000);
+        });
+    }
+
+    async function runTest() {
+        let browser;
+        try {
+            browser = await chromium.launch({ args: ['--no-sandbox'] });
+            const page = await browser.newPage();
+            const errors = [];
+            
+            page.on('console', msg => { 
+                if(msg.type() === 'error' || msg.type() === 'warning') {
+                    const loc = msg.location();
+                    const locStr = loc.url ? ` (at ${loc.url}:${loc.lineNumber})` : '';
+                    errors.push(`[${msg.type().toUpperCase()}] ${msg.text()}${locStr}`); 
+                }
+            });
+            
+            page.on('pageerror', err => errors.push(`[PAGE CRASH] ${err.message}`));
+            
+            page.on('response', response => {
+                if (response.status() >= 400) {
+                    errors.push(`[NETWORK ${response.status()}] ${response.request().method()} ${response.url()}`);
+                }
+            });
+            
+            await page.addInitScript(() => {
+                const originalSetTimeout = window.setTimeout;
+                window.setTimeout = function(callback, delay, ...args) {
+                    return originalSetTimeout(callback, 0, ...args);
+                };
+            });
+
+            await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+
+            if (TARGET_SELECTOR) {
+                try {
+                    await page.waitForSelector(TARGET_SELECTOR, { state: 'attached', timeout: 5000 });
+                } catch (e) {
+                    errors.push(`[TIMEOUT] Expected element '${TARGET_SELECTOR}' never appeared.`);
+                }
+            }
+
+            await page.waitForTimeout(500);
+            
+            let result = "=== BROWSER DIAGNOSTICS ===\\n";
+            result += errors.length ? errors.join('\\n') : "SUCCESS: No console errors detected.";
+            return result;
+
+        } catch (e) {
+            return `Failed to inspect URL: ${e.message}`;
+        } finally {
+            if (browser) await browser.close();
+        }
+    }
+
+    async function main() {
+        try { execSync('fuser -k -9 5000/tcp 5001/tcp 5002/tcp 5003/tcp 2>/dev/null'); } catch(e) {}
+
+        healDependencies();
+
+        let firebaseDir = REPO_ROOT;
+        try {
+            const fbPath = execSync(`find '${REPO_ROOT}' -maxdepth 3 -name firebase.json | head -n 1`, { encoding: 'utf-8' }).trim();
+            if (fbPath) firebaseDir = path.dirname(fbPath);
+        } catch (e) {}
+
+        console.log(`[SYSTEM] Booting server in ${firebaseDir}...`);
+        
+        const serverProcess = spawn('npx', ['firebase', 'emulators:start'], { 
+            cwd: firebaseDir,
+            detached: true 
+        });
+
+        let serverLogs = '';
+        serverProcess.stdout.on('data', d => serverLogs += d.toString());
+        serverProcess.stderr.on('data', d => serverLogs += d.toString());
+
+        const isReady = await waitForEnvironment(serverProcess, PORT);
+
+        if (!isReady) {
+            console.log(`\n[CRITICAL] Server failed to boot or bind to port ${PORT} within 30 seconds.`);
+            console.log(`=== SERVER BOOT LOGS ===\n${serverLogs.slice(-2500)}`);
+            try { process.kill(-serverProcess.pid, 'SIGKILL'); } catch(e) {}
+            process.exit(1);
+        } else {
+            console.log(`[SYSTEM] Server successfully bound to port ${PORT}. Running tests...`);
+            const result = await runTest();
+            console.log('\n=== TEST RESULTS ===\n' + result);
+            
+            // If the test hit a logical server error (404/500), the AI needs the backend logs to debug!
+            if (result.includes('HTTP_STATUS:4') || result.includes('HTTP_STATUS:5') || result.includes('TEST FAILED')) {
+                console.log('\n=== BACKEND SERVER LOGS (Diagnostic) ===\n' + serverLogs.slice(-2000));
+            }
+        }
+
+        try { process.kill(-serverProcess.pid, 'SIGTERM'); } catch(e) {}
+        setTimeout(() => {
+            try { execSync('fuser -k -9 5000/tcp 5001/tcp 5002/tcp 5003/tcp 2>/dev/null'); } catch(e) {}
+            process.exit(0);
+        }, 1000);
+    }
+
+    main();
+    """
+
+    node_runner_script = node_runner_script.replace("__REPO_ROOT__", json.dumps(repo_root))
+    node_runner_script = node_runner_script.replace("__TARGET_URL_PATH__", json.dumps(url_path))
+    node_runner_script = node_runner_script.replace("__TARGET_SELECTOR__", json.dumps(wait_for_selector))
+
+    try:
+        workspace.files.write(runner_path, node_runner_script)
+        # Global NODE_PATH required for Playwright module resolution
+        run_cmd = f"{export_prefix} NODE_PATH=$(npm root -g) node {runner_path}"
+        result = workspace.commands.run(run_cmd)
+        
+        workspace.commands.run(f"rm -f {runner_path}")
+        return result.stdout or result.stderr
+        
+    except Exception as e:
+        return f"CRITICAL TOOL EXCEPTION: {str(e)}\n\n(Note to AI: The testing orchestrator crashed. Check system state.)"
 
 def _parse_github_time(ts_str: str) -> datetime:
     """Safely converts a GitHub ISO 8601 string to a datetime object."""
@@ -236,8 +628,8 @@ def run_terminal_command(thought: str, command: str, config: RunnableConfig) -> 
     if any(bad_cmd in command.lower() for bad_cmd in forbidden_server_commands):
         return (
             "CRITICAL SYSTEM ERROR: You attempted to start a persistent web server using `run_terminal_command`. "
-            "This is strictly forbidden because it will cause a timeout and break the sandbox ports. "
-            "You MUST use the `manage_dev_server` tool with `action='start'` to run this command instead."
+            "This is strictly forbidden because it will freeze the terminal. "
+            "You MUST use the `run_backend_test` or `run_frontend_test` tools to automatically boot the environment and test your code instead."
         )
 
     # --- ENFORCE GITIGNORE BEFORE INSTALLS ---
@@ -555,217 +947,6 @@ def sync_wip_commit(thought: str, commit_message: str, config: RunnableConfig) -
         
     except Exception as e:
         return f"WIP Sync execution failed: {str(e)}"
-
-@tool(args_schema=ManageDevServerInput)
-def manage_dev_server(thought: str, action: str, command: str, config: RunnableConfig) -> str:
-    """Manages background development servers. Use this to start a server without timing out, check its logs, and stop it."""
-    workspace = config.get("configurable", {}).get("sandbox")
-    if not workspace: return "Error: No active sandbox."
-    
-    # Consistent file paths
-    log_file = "/tmp/server_logs.txt"
-    pid_file = "/tmp/server_pid.txt"
-
-    if action == "start":
-        if not command: return "Error: Must provide a command."
-        
-        export_prefix = config.get("configurable", {}).get("export_prefix", "")
-        repo_root = config.get("configurable", {}).get("repo_root", ".")
-
-        # Clean up old state first
-        workspace.commands.run(f"rm -f {log_file} {pid_file}")
-
-        try:
-            # Force write the initial line BEFORE starting the server
-            workspace.files.write(log_file, "=== SERVER INITIALIZING IN BACKGROUND ===\nWait at least 20s for logs to appear...\n")
-
-            # Intelligently find the directory containing firebase.json
-            cd_cmd = f"cd $(find '{repo_root}' -maxdepth 3 -name firebase.json -printf '%h\\n' | head -n 1) || cd '{repo_root}'"
-            
-            # Native E2B background execution.
-            # Group the commands inside { } so that ALL output (even from the cd command) is captured in the log file.
-            secure_command = f"{{ {export_prefix}{cd_cmd} && {command}; }} >> {log_file} 2>&1"
-            
-            # Inject only THIS client's secrets and use 'setsid' to create a new Process Group
-            process = workspace.commands.run(
-                f"setsid bash -c {shlex.quote(secure_command)}", 
-                background=True,
-            )
-            
-            # Record the PID (which acts as the Process Group ID)
-            workspace.files.write(pid_file, str(process.pid))
-            
-            # Synchronous Polling Loop
-            print(f"[SYSTEM] Waiting for server (PGID {process.pid}) to boot...")
-            max_wait_time = 30
-            booted = False
-            
-            for _ in range(max_wait_time // 2):
-                time.sleep(2) # Pause the Python thread, delaying the LLM's next turn
-                
-                # 1. LOGICAL LIVENESS CHECK: Did the background process group die unexpectedly?
-                # The minus sign (-) targets the entire process group
-                is_alive_check = workspace.commands.run(f"kill -0 -$(cat {pid_file} 2>/dev/null) 2>/dev/null")
-                if is_alive_check.exit_code != 0:
-                    break # Process crashed, break immediately to report the error
-
-                # Read the current state of the logs from E2B
-                current_logs_result = workspace.commands.run(f"tail -n 50 {log_file}")
-                current_logs = current_logs_result.stdout or ""
-                
-                # 2. FAILURE CHECK: Catch crash signatures in the logs
-                if any(err in current_logs for err in ["Failed to start", "port taken", "Error:", "No such file", "command not found"]):
-                    break # Boot failed, break early
-                
-                # 3. LOGICAL NETWORK VERIFICATION: Verify the port is actually bound
-                if "All emulators ready" in current_logs or "listening on port" in current_logs:
-                    # Dynamically find the port the AI defined in the logs or fallback to a standard port
-                    # Use netcat (nc) to perform a TCP ping. -z means zero-I/O (just scan), -w 1 is a 1-second timeout
-                    tcp_check = workspace.commands.run(
-                        "PORT=$(grep -oP '(?<=port )[0-9]+|(?<=:)[0-9]{4}' /tmp/server_logs.txt | tail -n 1); "
-                        "if [ -z \"$PORT\" ]; then PORT=5000; fi; "
-                        "nc -z -w 1 localhost $PORT"
-                    )
-                    
-                    if tcp_check.exit_code == 0:
-                        booted = True # The port is actively accepting connections!
-                        break
-                    
-                    # NOTE: If the log says "listening" but netcat fails, we intentionally DO NOT break. 
-                    # The loop will naturally continue to the next 2-second tick and try again.
-
-            # Fetch final logs to return to the agent immediately
-            final_logs = workspace.commands.run(f"tail -n 50 {log_file}").stdout
-            
-            if booted:
-                return f"SUCCESS: Server started securely in the background. Initial Boot Logs:\n{final_logs}"
-            else:
-                return f"WARNING: Server failed to start or crashed. Review the logs to diagnose the issue:\n{final_logs}"
-            
-        except Exception as e:
-            return f"Failed to start server: {str(e)}"
-    
-    elif action == "logs":
-        # Check if file exists, then tail.
-        cmd = f"[ -f {log_file} ] && tail -n 100 {log_file} || echo 'No log file found yet. Wait longer.'"
-        res = workspace.commands.run(f"bash -c {shlex.quote(cmd)}")
-        return f"Server Logs:\n{res.stdout or res.stderr}"
-        
-    elif action == "stop":
-        cleanup_cmd = f"""
-        if [ -f "{pid_file}" ]; then
-            PGID=$(cat "{pid_file}")
-            if [ -n "$PGID" ]; then
-                echo "Terminating Process Group: $PGID"
-                # The minus sign (-$PGID) sends the signal to the ENTIRE process tree.
-                # This guarantees all child nodes and emulators drop their ports instantly.
-                kill -15 -$PGID 2>/dev/null || true
-                sleep 1
-                kill -9 -$PGID 2>/dev/null || true
-            fi
-            rm -f "{pid_file}" "{log_file}"
-        else
-            echo "No active server found."
-        fi
-        exit 0
-        """
-        
-        try:
-            workspace.commands.run(f"bash -c {shlex.quote(cleanup_cmd)}")
-            return "Server and all child processes successfully terminated. Ports freed."
-        except Exception as e:
-            return f"Failed to stop server cleanly: {str(e)}"
-    
-    return "Invalid action."
-
-@tool(args_schema=InspectFrontendInput)
-def inspect_frontend(thought: str, url: str, config: RunnableConfig, wait_for_selector: str = "") -> str:
-    """Opens a headless browser, navigates to the URL, and returns console errors and network failures."""
-    workspace = config.get("configurable", {}).get("sandbox")
-    repo_root = config.get("configurable", {}).get("repo_root", ".")
-
-    # Create a unique filename inside the repo root
-    script_name = f"inspect_{int(time.time())}.js"
-    script_path = os.path.join(repo_root, script_name)
-
-    if not workspace:
-        return "Error: No active sandbox."
-    
-    # Write a quick Playwright script to the temp directory
-    script = f"""
-    const {{ chromium }} = require('playwright');
-    (async () => {{
-        try {{
-            const browser = await chromium.launch({{ args: ['--no-sandbox'] }});
-            const page = await browser.newPage();
-            const errors = [];
-            
-            // ENRICHED CONSOLE ERRORS (Includes Line Numbers & Files)
-            page.on('console', msg => {{ 
-                if(msg.type() === 'error' || msg.type() === 'warning') {{
-                    const loc = msg.location();
-                    const locStr = loc.url ? ` (at ${{loc.url}}:${{loc.lineNumber}})` : '';
-                    errors.push(`[${{msg.type().toUpperCase()}}] ${{msg.text()}}${{locStr}}`); 
-                }}
-            }});
-            
-            page.on('pageerror', err => errors.push(`[PAGE CRASH] ${{err.message}}`));
-            
-            // EXPLICIT NETWORK TRACKING (Captures exact failing API URLs)
-            page.on('response', response => {{
-                if (response.status() >= 400) {{
-                    errors.push(`[NETWORK ${{response.status()}}] ${{response.request().method()}} ${{response.url()}}`);
-                }}
-            }});
-            
-            // Hijack setTimeout to force all delays to 0ms in the test environment
-            await page.addInitScript(() => {{
-                const originalSetTimeout = window.setTimeout;
-                window.setTimeout = function(callback, delay, ...args) {{
-                    return originalSetTimeout(callback, 0, ...args); // Overrides any delay
-                }};
-            }});
-
-            await page.goto('{url}', {{ waitUntil: 'domcontentloaded', timeout: 15000 }});
-            
-            // ALWAYS wait for the network to go idle so async fetch() calls finish!
-            await page.waitForLoadState('networkidle', {{ timeout: 10000 }}).catch(() => {{}});
-
-            // Check the AI's selector AFTER the network has settled
-            // Deterministic Logic: Wait for the exact DOM element the AI expects
-            if ('{wait_for_selector}') {{
-                try {{
-                    // Reduced timeout since the network is already done loading
-                    await page.waitForSelector('{wait_for_selector}', {{ state: 'attached', timeout: 5000 }});
-                }} catch (e) {{
-                    errors.push(`[TIMEOUT] Expected element '{wait_for_selector}' never appeared. Async data may have failed.`);
-                }}
-            }}
-
-            // Add a tiny 500ms safety buffer for React/VanillaJS to render DOM updates 
-            // and throw console errors AFTER the fetch payload arrives.
-            await page.waitForTimeout(500);
-            
-            console.log("=== BROWSER DIAGNOSTICS ===");
-            console.log(errors.length ? errors.join('\\n') : "SUCCESS: No console errors detected.");
-            await browser.close();
-        }} catch (e) {{
-            console.log("Failed to inspect URL: " + e.message);
-        }}
-    }})();
-    """
-    workspace.files.write(script_path, script)
-    
-    # Grab the global prefix and execute cleanly(adding NODE_PATH back inline so Bash can evaluate it)
-    export_prefix = config.get("configurable", {}).get("export_prefix", "")
-    cmd = f"{export_prefix}NODE_PATH=$(npm root -g) node {script_path}"
-
-    res = workspace.commands.run(cmd)
-    
-    # Clean up the file after running so the directory stays clean
-    workspace.commands.run(f"rm {script_path}")
-
-    return res.stdout or res.stderr
 
 @tool(args_schema=WebSearchInput)
 def web_search(thought: str, query: str, config: RunnableConfig) -> str:

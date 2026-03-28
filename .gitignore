@@ -67,3 +67,4 @@ output/
 tenant_vault.json
 
 /inspect_db.py
+/backup.py

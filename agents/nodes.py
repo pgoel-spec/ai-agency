@@ -10,8 +10,8 @@ from .prompts import get_developer_prompt
 from .state import AgencyState, DEVELOPER_ITERATION_LIMIT
 from .tools import (
     update_linear_ticket, create_github_pr, run_terminal_command, 
-    read_file, write_file, sync_wip_commit, manage_dev_server, inspect_frontend,
-    web_search, generate_repo_map
+    read_file, write_file, sync_wip_commit, web_search, generate_repo_map,
+    run_backend_test, run_frontend_test, run_unit_tests
 )
 from database import get_logs_by_ticket, log_activity
 from tenacity import (
@@ -79,7 +79,7 @@ class DevOpsReport(BaseModel):
     pr_url: str = Field(description="The URL of the created PR, if applicable.", default="")
 
 manager_tools = [RouteDecision, update_linear_ticket]
-developer_tools = [ReportStatus, run_terminal_command, read_file, write_file, sync_wip_commit, manage_dev_server, inspect_frontend, web_search, generate_repo_map]
+developer_tools = [ReportStatus, run_terminal_command, read_file, write_file, sync_wip_commit, run_backend_test, run_frontend_test, run_unit_tests, web_search, generate_repo_map]
 devops_tools = [DevOpsReport, create_github_pr]
 
 # Initialize the Models via Vertex AI with JSON enforcement
@@ -735,8 +735,9 @@ def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
         "read_file": read_file,
         "write_file": write_file,
         "sync_wip_commit": sync_wip_commit,
-        "manage_dev_server": manage_dev_server,
-        "inspect_frontend": inspect_frontend,
+        "run_backend_test": run_backend_test,
+        "run_frontend_test": run_frontend_test,
+        "run_unit_tests": run_unit_tests,
         "web_search": web_search,
         "generate_repo_map": generate_repo_map
     }
@@ -785,11 +786,16 @@ def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
 
             # --- VERIFICATION TRACKING LOGIC ---
             if tool_name == "write_file":
-                has_verified = False # Reset verification when code changes
-            elif tool_name == "inspect_frontend":
-                has_verified = True  # Successfully tested frontend
-            elif tool_name == "manage_dev_server" and tool["args"].get("action") == "logs":
-                has_verified = True  # Successfully checked backend logs
+                # Check if the AI is ONLY updating the technical plan
+                files_written = tool["args"].get("files", [])
+                
+                # If every file being written is just the plan, do NOT reset the verification flag
+                is_only_docs = all("TECHNICAL_PLAN.md" in f.get("file_path", "") for f in files_written)
+                
+                if not is_only_docs:
+                    has_verified = False # Reset verification when actual code changes
+            elif tool_name in ["run_frontend_test", "run_backend_test", "run_unit_tests"]:
+                has_verified = True  # Successfully ran a pipeline test
             elif tool_name == "run_terminal_command":
                 cmd = tool["args"].get("command", "").lower()
                 # If the agent runs a test file, allow it to satisfy the Verification Gate

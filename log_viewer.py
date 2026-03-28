@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 from onboarding import get_layout_header, get_sidebar_html, get_project_sidebar_html, get_vault
 from database import get_all_sessions, get_logs_by_ticket, get_logs_by_session
+from datetime import datetime
 
 router = APIRouter()
 
@@ -19,7 +20,29 @@ def view_all_logs(project: str = None):
         s_id = row.get("session_id")
         p_id = row.get("project_id")
         last_active = row.get("last_active")
+        first_active = row.get("first_active")
+        total_input_tokens = row.get("total_input_tokens") or 0
         
+        # --- 1. CALCULATE DURATION ---
+        duration_str = "0m 0s"
+        if first_active and last_active:
+            try:
+                # SQLite timestamps are usually 'YYYY-MM-DD HH:MM:SS'
+                # We slice [:19] to safely ignore any fractional seconds if they exist
+                t1 = datetime.strptime(first_active[:19], "%Y-%m-%d %H:%M:%S")
+                t2 = datetime.strptime(last_active[:19], "%Y-%m-%d %H:%M:%S")
+                diff_seconds = (t2 - t1).total_seconds()
+                
+                mins = int(diff_seconds // 60)
+                secs = int(diff_seconds % 60)
+                duration_str = f"{mins}m {secs}s"
+            except ValueError:
+                pass # Fallback to 0m 0s if date format is unexpected
+
+        # --- 2. CALCULATE COST (Gemini 2.5 Pro is ~$1.25 per 1M input tokens) ---
+        cost = (total_input_tokens / 1_000_000) * 1.25
+        cost_str = f"${cost:.4f}" # Show fractions of a cent since single runs are cheap
+
         # Resolve project name
         p_name = vault.get(p_id, {}).get("project_name", "Unknown Project") if p_id else "Legacy Data"
         if p_id:
@@ -42,7 +65,10 @@ def view_all_logs(project: str = None):
         if s_id:
             tickets[group_key]["sessions"].append({
                 "session_id": s_id,
-                "last_active": last_active
+                "last_active": last_active,
+                "duration": duration_str,   
+                "cost": cost_str,           
+                "tokens": total_input_tokens
             })
 
     sorted_tickets = sorted(tickets.values(), key=lambda x: x["last_active"] or "", reverse=True)
@@ -139,10 +165,17 @@ def view_all_logs(project: str = None):
                 sorted_sessions = sorted(data["sessions"], key=lambda x: x["last_active"] or "", reverse=True)
                 for s in sorted_sessions:
                     html_content += f"""
-                        <div class="flex items-center text-sm">
-                            <span class="text-gray-400 dark:text-gray-500 mr-2">↳</span>
-                            <a href="/logs/{t_id}/{s['session_id']}" target="_blank" class="text-gray-600 dark:text-gray-400 font-medium hover:text-blue-600 dark:hover:text-blue-400 hover:underline mr-3">Session: {s['session_id']}</a>
-                            <span class="text-xs text-gray-400">({s['last_active']})</span>
+                        <div class="flex items-center justify-between text-sm py-1">
+                            <div class="flex items-center">
+                                <span class="text-gray-400 dark:text-gray-500 mr-2">↳</span>
+                                <a href="/logs/{t_id}/{s['session_id']}" target="_blank" class="text-gray-600 dark:text-gray-400 font-medium hover:text-blue-600 dark:hover:text-blue-400 hover:underline mr-3">Session: {s['session_id']}</a>
+                                <span class="text-xs text-gray-400">({s['last_active']})</span>
+                            </div>
+                            <div class="flex items-center space-x-4 text-xs font-mono text-gray-500 dark:text-gray-400">
+                                <span title="Input Tokens">🪙 {s['tokens']:,} tkns</span>
+                                <span title="Session Duration">⏱️ {s['duration']}</span>
+                                <span title="Estimated Cost" class="text-green-600 dark:text-green-400 font-medium">{s['cost']}</span>
+                            </div>
                         </div>
                     """
                 html_content += "</div>"

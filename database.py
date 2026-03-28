@@ -124,7 +124,7 @@ def get_all_sessions():
         
         # We fetch everything, grouping by both so we know exactly which sessions belong to which tickets
         cursor.execute('''
-            SELECT ticket_id, session_id, MAX(project_id) as project_id, MAX(timestamp) as last_active
+            SELECT ticket_id, session_id, MAX(project_id) as project_id, MIN(timestamp) as first_active, MAX(timestamp) as last_active, SUM(input_tokens) as total_input_tokens
             FROM activity_logs 
             WHERE ticket_id IS NOT NULL
             GROUP BY ticket_id, session_id
