@@ -3,6 +3,7 @@ import json
 import httpx
 import base64
 import uuid
+import secrets
 from datetime import datetime
 from fastapi import APIRouter, Request, Form, Path
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -22,7 +23,7 @@ def get_vault():
             return json.load(f)
     return {}
 
-def save_project_full(project_id: str, project_name: str, github_repo: str, github_token: str):
+def save_project_full(project_id: str, project_name: str, github_repo: str, github_token: str, webhook_secret: str = None):
     vault = get_vault()
     if project_id not in vault:
         vault[project_id] = {
@@ -32,10 +33,14 @@ def save_project_full(project_id: str, project_name: str, github_repo: str, gith
             "e2b_template": "",
             "secrets": {},
             "github_webhook_status": "pending",
-            "is_active": True
+            "is_active": True,
+            "webhook_secret": webhook_secret or secrets.token_urlsafe(32)
         }
     else:
         vault[project_id]["project_name"] = project_name
+        # Ensure existing projects get a secret too
+        if "webhook_secret" not in vault[project_id]:
+            vault[project_id]["webhook_secret"] = webhook_secret or secrets.token_urlsafe(32)
         
     vault[project_id]["github_repo"] = github_repo
     vault[project_id]["github_token"] = github_token
@@ -111,14 +116,22 @@ class ToggleRequest(BaseModel):
 async def api_onboard_project(request: ProjectRequest):
     is_new = not request.project_id
     project_id = request.project_id if request.project_id else str(uuid.uuid4())[:8]
-    save_project_full(project_id, request.project_name, request.github_repo, request.github_token)
+    
+    # Generate or fetch secret
+    vault = get_vault()
+    webhook_secret = vault.get(project_id, {}).get("webhook_secret") if not is_new else secrets.token_urlsafe(32)
+    if not webhook_secret:
+        webhook_secret = secrets.token_urlsafe(32)
+
+    save_project_full(project_id, request.project_name, request.github_repo, request.github_token, webhook_secret)
     
     if request.run_test:
         success = await inject_github_workflow(project_id, request.github_repo, request.github_token)
         new_status = "success" if success else "failed"
         save_tenant_secret(project_id, "github_webhook_status", new_status)
-        return {"success": success, "status": new_status, "project_id": project_id, "is_new": is_new, "tested": True}
-    return {"success": True, "status": "saved", "project_id": project_id, "is_new": is_new, "tested": False}
+        return {"success": success, "status": new_status, "project_id": project_id, "is_new": is_new, "tested": True, "webhook_secret": webhook_secret}
+    
+    return {"success": True, "status": "saved", "project_id": project_id, "is_new": is_new, "tested": False, "webhook_secret": webhook_secret}
 
 @router.post("/api/project/{project_id}/toggle")
 async def api_toggle_project(project_id: str, request: ToggleRequest):
@@ -288,8 +301,8 @@ def get_project_sidebar_html(project_id, project_name, active_page="pipeline"):
     """
 
 def generate_card_html(proj_id, data):
-    proj_name = data.get("project_name", proj_id) 
-    repo = data.get("github_repo", "")
+    proj_name = data.get("project_name", proj_id).replace("'", "\\'")
+    repo = data.get("github_repo", "").replace("'", "\\'")
     token = data.get("github_token", "")
     created_at = data.get("created_at", "Legacy Entry")
     is_active = data.get("is_active", True)
@@ -303,6 +316,7 @@ def generate_card_html(proj_id, data):
     else: gh_badge = '<span class="px-2 py-1 bg-red-50 dark:bg-red-900/20 border border-red-200 text-red-700 dark:text-red-400 text-xs font-medium rounded">Failed</span>'
     
     has_lin_str = "true" if has_linear else "false"
+    wh_secret = data.get("webhook_secret", "")
     bg_color = "bg-blue-600" if is_active else "bg-gray-300 dark:bg-[#333333]"
     translate_dot = "translate-x-5" if is_active else "translate-x-0"
 
@@ -312,7 +326,7 @@ def generate_card_html(proj_id, data):
             <div class="flex justify-between items-start mb-1">
                 <h3 class="text-lg font-medium text-gray-800 dark:text-log-text break-all pr-2">{proj_name}</h3>
                 <div class="flex space-x-2 flex-shrink-0">
-                    <button onclick="event.preventDefault(); event.stopPropagation(); openModal('{proj_id}', '{proj_name}', '{repo}', '{token}', '{gh_status}', {has_lin_str})" class="text-gray-400 hover:text-blue-600 transition bg-transparent p-1" title="Edit Project">
+                    <button onclick="event.preventDefault(); event.stopPropagation(); openModal('{proj_id}', '{proj_name}', '{repo}', '{token}', '{gh_status}', {has_lin_str}, '{wh_secret}')" class="text-gray-400 hover:text-blue-600 transition bg-transparent p-1" title="Edit Project">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg>
                     </button>
                     <button onclick="event.preventDefault(); event.stopPropagation(); deleteProject('{proj_id}')" class="text-gray-400 hover:text-red-600 transition bg-transparent p-1" title="Delete Project">
@@ -364,8 +378,43 @@ def get_modal_html():
             <p id="modal-subtitle" class="text-sm text-gray-600 dark:text-gray-400 mb-4">Connect a repository for your AI Developer.</p>
             
             <div class="flex border-b border-gray-200 dark:border-log-border mb-6 flex-shrink-0">
-                <button type="button" id="tab-1" onclick="switchTab(1)" class="w-1/2 py-3 text-sm text-center font-bold border-b-2 border-blue-600 text-blue-600 dark:text-blue-400 transition">1. GitHub Setup</button>
-                <button type="button" id="tab-2" onclick="switchTab(2)" class="w-1/2 py-3 text-sm text-center font-bold border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">2. Issue Tracking</button>
+                <button type="button" id="tab-1" onclick="switchTab(1)" class="w-1/3 py-3 text-sm text-center font-bold border-b-2 border-blue-600 text-blue-600 dark:text-blue-400 transition">1. GitHub</button>
+                <button type="button" id="tab-2" onclick="switchTab(2)" class="w-1/3 py-3 text-sm text-center font-bold border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">2. Issue Tracking</button>
+                <button type="button" id="tab-3" onclick="switchTab(3)" class="w-1/3 py-3 text-sm text-center font-bold border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">3. CI/CD Setup</button>
+            </div>
+
+            <div id="step-3" class="hidden flex-1 flex-col overflow-y-auto pb-4">
+                <div class="mb-4">
+                    <p class="text-sm text-gray-600 dark:text-gray-400">To allow the AI to automatically fix build errors, add this integration to your GitHub Actions.</p>
+                </div>
+                <div class="space-y-4">
+                    <div>
+                        <h4 class="text-sm font-bold text-gray-800 dark:text-gray-200 mb-1">Step A: Add GitHub Secret</h4>
+                        <p class="text-xs text-gray-500 mb-2">Go to your Repository -> Settings -> Secrets and Variables -> Actions. Create a new secret named <code>AGENCY_WEBHOOK_SECRET</code> with this value:</p>
+                        <div class="bg-gray-100 dark:bg-[#1e1e1e] p-2 rounded border border-gray-300 dark:border-log-border flex justify-between items-center">
+                            <code id="snippet-webhook-secret" class="text-xs text-blue-600 dark:text-blue-400 break-all font-mono">Save project first...</code>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between items-center mb-1">
+                            <h4 class="text-sm font-bold text-gray-800 dark:text-gray-200">Step B: Update Workflow YAML</h4>
+                            <button type="button" onclick="copyYamlSnippet(this)" class="text-xs bg-gray-200 hover:bg-gray-300 dark:bg-[#333333] dark:hover:bg-[#444444] text-gray-700 dark:text-gray-300 font-bold py-1 px-2 rounded transition border border-gray-300 dark:border-log-border flex items-center">
+                                <svg class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                                <span class="btn-text">Copy</span>
+                            </button>
+                        </div>
+                        <p class="text-xs text-gray-500 mb-2">Paste this snippet at the very end of your deployment <code>.yml</code> file:</p>
+                        <textarea id="yaml-template" class="hidden">      - name: Report Build Failure to AI Agency
+        if: failure()
+        run: |
+          ERROR_LOG=$(tail -c 3000 /home/runner/work/.../build.log || echo "Check Actions UI")
+          curl -X POST -H "Content-Type: application/json" \\
+          -H "X-Agency-Signature: ${{ secrets.AGENCY_WEBHOOK_SECRET }}" \\
+          -d "{\"tenant_id\": \"__TENANT_ID__\", \"branch_name\": \"${{ github.head_ref || github.ref_name }}\", \"commit_sha\": \"${{ github.sha }}\", \"error_log\": \"$ERROR_LOG\"}" \\
+          https://api.yoursaas.com/webhooks/pr-build-failed</textarea>
+                        <pre class="bg-gray-900 text-gray-300 p-3 rounded-lg text-xs overflow-x-auto border border-gray-700 font-mono leading-relaxed"><code id="yaml-snippet-code">Save project first to generate code...</code></pre>
+                    </div>
+                </div>
             </div>
 
             <form id="step-1" class="flex-1 flex flex-col">
@@ -396,12 +445,9 @@ def get_modal_html():
                     </div>
                 </div>
 
-                <div class="mt-auto flex space-x-3 pt-4 border-t border-gray-100 dark:border-log-border">
-                    <button type="button" id="btn-test-connection" onclick="submitOnboardForm(true)" class="w-1/3 bg-gray-100 dark:bg-[#333333] hover:bg-gray-200 dark:hover:bg-[#444444] text-gray-700 dark:text-log-text font-bold py-2 px-2 rounded-lg transition text-sm border border-gray-300 dark:border-log-border">
-                        Test Connect
-                    </button>
-                    <button type="button" onclick="submitOnboardForm(false)" class="w-2/3 bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition shadow-md text-sm">
-                        Save & Next
+                <div class="mt-auto flex justify-end pt-4 border-t border-gray-100 dark:border-log-border">
+                    <button type="button" id="btn-test-connection" onclick="submitOnboardForm(true)" class="bg-gray-800 hover:bg-gray-900 text-white font-bold py-2 px-4 rounded transition shadow-md text-sm">
+                        Test Connection & Save
                     </button>
                 </div>
             </form>
@@ -441,6 +487,16 @@ def get_modal_html():
                     </div>
                 </div>
             </div>
+
+            <div class="mt-6 pt-4 border-t border-gray-200 dark:border-log-border flex justify-end space-x-3 bg-gray-50 dark:bg-[#1e1e1e] -mx-8 -mb-8 p-6 rounded-b-xl flex-shrink-0">
+                <button type="button" onclick="closeModal()" class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-[#2d2d2d] border border-gray-300 dark:border-log-border rounded-lg hover:bg-gray-50 dark:hover:bg-[#3d3d3d] transition">
+                    Cancel
+                </button>
+                <button type="button" onclick="submitOnboardForm(false)" class="px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-lg hover:bg-blue-700 transition shadow-sm">
+                    Save Project
+                </button>
+            </div>
+
         </div>
     </div>
     """
@@ -544,24 +600,45 @@ def admin_dashboard():
             {get_modal_html()}
             
             <script>
+                function updateYamlSnippet(tenantId) {{
+                    const template = document.getElementById('yaml-template').value;
+                    document.getElementById('yaml-snippet-code').innerText = template.replace('__TENANT_ID__', tenantId);
+                }}
+
+                async function copyYamlSnippet(btn) {{
+                    const codeText = document.getElementById('yaml-snippet-code').innerText;
+                    try {{
+                        await navigator.clipboard.writeText(codeText);
+                        const span = btn.querySelector('.btn-text');
+                        const originalText = span.innerText;
+                        span.innerText = "Copied!";
+                        btn.classList.add("text-green-600", "dark:text-green-400");
+                        setTimeout(() => {{
+                            span.innerText = originalText;
+                            btn.classList.remove("text-green-600", "dark:text-green-400");
+                        }}, 2000);
+                    }} catch (err) {{
+                        alert("Failed to copy code.");
+                    }}
+                }}
                 function switchTab(step) {{
-                    const t1 = document.getElementById('tab-1'), t2 = document.getElementById('tab-2');
-                    const s1 = document.getElementById('step-1'), s2 = document.getElementById('step-2');
-                    const aClass = "w-1/2 py-3 text-sm text-center font-bold border-b-2 border-blue-600 text-blue-600 dark:text-blue-400 transition";
-                    const iClass = "w-1/2 py-3 text-sm text-center font-bold border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition";
+                    const aClass = "w-1/3 py-3 text-sm text-center font-bold border-b-2 border-blue-600 text-blue-600 dark:text-blue-400 transition";
+                    const iClass = "w-1/3 py-3 text-sm text-center font-bold border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition";
                     
-                    if (step === 1) {{
-                        t1.className = aClass; t2.className = iClass;
-                        s1.classList.remove('hidden'); s1.classList.add('flex');
-                        s2.classList.remove('flex'); s2.classList.add('hidden');
-                    }} else {{
-                        t1.className = iClass; t2.className = aClass;
-                        s1.classList.remove('flex'); s1.classList.add('hidden');
-                        s2.classList.remove('hidden'); s2.classList.add('flex');
+                    for (let i = 1; i <= 3; i++) {{
+                        const tab = document.getElementById('tab-' + i);
+                        const stp = document.getElementById('step-' + i);
+                        if (i === step) {{
+                            tab.className = aClass;
+                            stp.classList.remove('hidden'); stp.classList.add('flex');
+                        }} else {{
+                            tab.className = iClass;
+                            stp.classList.remove('flex'); stp.classList.add('hidden');
+                        }}
                     }}
                 }}
 
-                function openModal(pId = '', pName = '', repo = '', token = '', ghStatus = '', hasLin = false) {{
+                function openModal(pId = '', pName = '', repo = '', token = '', ghStatus = '', hasLin = false, whSecret = '') {{
                     document.getElementById('project-id').value = pId;
                     document.getElementById('project-name').value = pName;
                     document.getElementById('github-repo').value = repo;
@@ -571,6 +648,9 @@ def admin_dashboard():
                         document.getElementById('linear-oauth-btn').href = `/install/linear?project_id=${{pId}}`;
                         document.getElementById('modal-title').innerText = "Edit Project";
                         document.getElementById('modal-subtitle').innerText = `Update details for ${{pName}}.`;
+                        
+                        updateYamlSnippet(pId);
+                        document.getElementById('snippet-webhook-secret').innerText = whSecret || "Save project to generate secret...";
                         
                         if (hasLin) {{
                             document.getElementById('linear-status-text').innerText = "Connected and active";
@@ -596,6 +676,10 @@ def admin_dashboard():
                         document.getElementById('linear-status-text').classList.replace("text-green-600", "text-gray-500");
                         document.getElementById('linear-oauth-btn').classList.remove('hidden');
                         document.getElementById('linear-disconnect-btn').classList.add('hidden');
+                        
+                        updateYamlSnippet("YOUR_TENANT_ID");
+                        document.getElementById('snippet-webhook-secret').innerText = "Save project first...";
+                        
                         switchTab(1);
                     }}
 
@@ -641,6 +725,11 @@ def admin_dashboard():
                         if (data.project_id) {{
                             document.getElementById('project-id').value = data.project_id;
                             document.getElementById('linear-oauth-btn').href = `/install/linear?project_id=${{data.project_id}}`;
+                            
+                            if (data.webhook_secret) {{
+                                updateYamlSnippet(data.project_id);
+                                document.getElementById('snippet-webhook-secret').innerText = data.webhook_secret;
+                            }}
                         }}
                         
                         if (runTest) {{

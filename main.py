@@ -5,7 +5,7 @@ import time
 import re
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request, BackgroundTasks, Header, HTTPException
 from pydantic import BaseModel
 from datetime import datetime
 
@@ -15,6 +15,7 @@ from onboarding import router as onboarding_router, get_vault
 from log_viewer import router as log_viewer_router
 from engine import run_pipeline_task
 from pipeline_api import router as pipeline_router
+from webhook_handler import process_github_webhook, WebhookSecurityError
 
 load_dotenv() # Load the .env file so the API keys are available to the tools
 
@@ -116,6 +117,21 @@ async def handle_preview_ready(payload: PreviewPayload):
         return {"status": "success", "message": "Preview URL posted to Linear."}
     else:
         return {"status": "error", "details": response.text}
+
+@app.post("/webhooks/pr-build-failed")
+async def fastapi_adapter(request: Request, x_agency_signature: str = Header(None)):
+    raw_body = await request.body()
+    
+    try:
+        result = process_github_webhook(
+            raw_body=raw_body,
+            signature_header=x_agency_signature,
+            get_tenant_secret_func=my_vault_lookup_function,
+            update_db_func=my_database_update_function
+        )
+        return result
+    except WebhookSecurityError as e:
+        raise HTTPException(status_code=401, detail=str(e))
 
 @app.post("/webhook")
 async def linear_webhook(request: Request, background_tasks: BackgroundTasks):

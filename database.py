@@ -132,6 +132,20 @@ def get_all_sessions():
         ''')
         return [dict(row) for row in cursor.fetchall()]
 
+def get_sessions_by_project(project_id: str):
+    """Fetches all unique ticket and session combinations for a specific project."""
+    with get_db_conn() as conn:
+        conn.row_factory = sqlite3.Row 
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT ticket_id, session_id, MAX(timestamp) as last_active
+            FROM activity_logs 
+            WHERE project_id = ? AND ticket_id IS NOT NULL
+            GROUP BY ticket_id, session_id
+            ORDER BY last_active DESC
+        ''', (project_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
 def init_pipeline_db():
     """Initializes the persistent task queue database."""
     with sqlite3.connect(PIPELINE_DB_PATH) as conn:
@@ -142,13 +156,26 @@ def init_pipeline_db():
                 status TEXT,
                 human_input TEXT,
                 created_at TIMESTAMP,
-                updated_at TIMESTAMP
+                updated_at TIMESTAMP,
+                build_error_log TEXT,
+                latest_commit_sha TEXT
             )
         """)
+
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN build_error_log TEXT")
+        except sqlite3.OperationalError:
+            pass # Column already exists
+            
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN latest_commit_sha TEXT")
+        except sqlite3.OperationalError:
+            pass
+    
         conn.commit()
 
 def get_active_tasks(project_id: str):
-    """Fetches all tasks that are currently Pending, Running, or Failed."""
+    """Fetches all tasks that are currently Pending, Running, Failed, or BLOCKED_PR_BUILD."""
     with sqlite3.connect(PIPELINE_DB_PATH) as conn:
         conn.row_factory = sqlite3.Row  # This lets us return dicts easily
         cursor = conn.cursor()
@@ -168,27 +195,23 @@ def get_pipeline_task(task_id: str):
         row = cursor.fetchone()
         return dict(row) if row else None
 
-def update_task_status(task_id: str, new_status: str):
+def update_task_status(task_id: str, new_status: str, error_log: str = None, commit_sha: str = None):
     with sqlite3.connect(PIPELINE_DB_PATH) as conn:
-        conn.execute(
-            "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
-            (new_status, datetime.utcnow().isoformat(), task_id)
-        )
+        if error_log is not None or commit_sha is not None:
+            # Update status AND the new webhook columns
+            conn.execute(
+                """UPDATE tasks 
+                   SET status = ?, updated_at = ?, build_error_log = ?, latest_commit_sha = ? 
+                   WHERE task_id = ?""",
+                (new_status, datetime.utcnow().isoformat(), error_log, commit_sha, task_id)
+            )
+        else:
+            # Standard update (just status and timestamp)
+            conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+                (new_status, datetime.utcnow().isoformat(), task_id)
+            )
         conn.commit()
-
-def get_sessions_by_project(project_id: str):
-    """Fetches all unique ticket and session combinations for a specific project."""
-    with get_db_conn() as conn:
-        conn.row_factory = sqlite3.Row 
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT ticket_id, session_id, MAX(timestamp) as last_active
-            FROM activity_logs 
-            WHERE project_id = ? AND ticket_id IS NOT NULL
-            GROUP BY ticket_id, session_id
-            ORDER BY last_active DESC
-        ''', (project_id,))
-        return [dict(row) for row in cursor.fetchall()]
 
 def get_completed_tasks(project_id: str):
     """Fetches all tasks that have finished or been dismissed."""
