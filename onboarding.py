@@ -1040,20 +1040,73 @@ def project_workspace(project_id: str = Path(...)):
                                            controls;
                             }}
 
-                            let statusColor = task.status === "Failed" ? "text-red-600 bg-red-50 dark:bg-red-900/20 border-red-200" : "text-blue-600 bg-blue-50 dark:bg-blue-900/20 border-blue-200";
+                            if (task.status === "AWAITING_PREVIEW" || task.status === "BLOCKED_PR_BUILD") {{
+                                controls = '<button onclick="syncGithub(event, \\'' + tId + '\\')" class="text-xs bg-gray-50 dark:bg-[#333333] text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 border border-gray-300 dark:border-log-border px-3 py-1 rounded transition flex items-center" title="Manually check GitHub Actions status">' +
+                                           '<svg class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>' +
+                                           'Sync Status</button>' + controls;
+                            }}
 
-                            html += '<div class="flex items-center justify-between p-4 bg-white dark:bg-[#252526] border border-gray-200 dark:border-log-border rounded mb-3">' +
-                                        '<div class="flex items-center gap-4">' +
-                                            '<div class="px-2 py-1 rounded text-xs font-medium border ' + statusColor + '">' +
-                                                statusStr +
-                                            '</div>' +
-                                            '<div>' +
-                                                '<div class="font-mono text-sm font-medium text-gray-900 dark:text-gray-100">' + tId + '</div>' +
-                                            '</div>' +
-                                        '</div>' +
+                            // --- Add Orange color for Blocked state ---
+                            let statusColor = "text-blue-600 bg-blue-50 dark:bg-blue-900/20 border-blue-200";
+                            if (task.status === "Failed") statusColor = "text-red-600 bg-red-50 dark:bg-red-900/20 border-red-200";
+                            else if (task.status === "BLOCKED_PR_BUILD") statusColor = "text-orange-600 bg-orange-50 dark:bg-orange-900/20 border-orange-200";
+
+                            // --- NEW: 1-Line Status Reason Snippet ---
+                            let reasonSnippet = '';
+                            if (task.build_error_log) {{
+                                let cleanLog = task.build_error_log.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                                // Grab just the first line and truncate it so it doesn't break the layout
+                                let shortLog = cleanLog.split('\\n')[0].substring(0, 85);
+                                if (cleanLog.length > 85) shortLog += '...';
+                                
+                                // Color it red if it's a failure or blocked state, otherwise gray
+                                let textClass = (task.status === "Failed" || task.status === "BLOCKED_PR_BUILD") 
+                                    ? "text-red-500/90 dark:text-red-400/90" 
+                                    : "text-gray-500";
+                                    
+                                reasonSnippet = '<div class="text-xs ' + textClass + ' mt-1 truncate max-w-md" title="' + cleanLog + '">' + shortLog + '</div>';
+                            }}
+                            
+                            // --- Construct the Error Block if Blocked ---
+                            let errorBlock = '';
+                            if (task.status === "BLOCKED_PR_BUILD") {{
+                                let errorLog = task.build_error_log || "No error log available.";
+                                errorLog = errorLog.replace(/</g, "&lt;").replace(/>/g, "&gt;"); // Safely escape HTML
+                                
+                                errorBlock = '<div class="mt-4 pt-4 border-t border-red-100 dark:border-red-900/30">' +
+                                    '<p class="text-xs font-bold text-red-600 dark:text-red-400 mb-2">Build Failed:</p>' +
+                                    '<div class="bg-gray-900 text-gray-300 p-3 rounded text-xs font-mono overflow-x-auto mb-3 max-h-32 overflow-y-auto whitespace-pre-wrap">' + errorLog + '</div>' +
+                                    '<div class="flex flex-col gap-2">' +
                                         '<div class="flex items-center gap-2">' +
-                                            controls +
+                                            '<input type="text" id="feedback-' + tId + '" placeholder="Optional: Tell AI how to fix this..." class="flex-1 text-xs bg-gray-50 dark:bg-[#1e1e1e] border border-gray-300 dark:border-log-border rounded px-2 py-1.5 focus:outline-none focus:border-blue-500 text-gray-800 dark:text-gray-200">' +
+                                            '<button onclick="resolveBuild(event, \\'' + tId + '\\', \\'code_fix\\')" class="text-xs bg-blue-600 hover:bg-blue-700 text-white font-medium px-3 py-1.5 rounded transition whitespace-nowrap">Ask AI to Fix</button>' +
                                         '</div>' +
+                                        '<div class="flex items-center gap-2 mt-1">' +
+                                            '<span class="text-xs text-gray-500 dark:text-gray-400">- OR -</span>' +
+                                            '<button onclick="resolveBuild(event, \\'' + tId + '\\', \\'infra_fix\\')" class="text-xs bg-gray-100 dark:bg-[#333333] hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 font-medium px-3 py-1.5 rounded transition whitespace-nowrap">I fixed it manually (Retry)</button>' +
+                                        '</div>' +
+                                    '</div>' +
+                                '</div>';
+                            }}
+
+                            // --- Inject errorBlock into the card layout ---
+                            // --- Inject reasonSnippet under the Task ID ---
+                            html += '<div class="p-4 bg-white dark:bg-[#252526] border border-gray-200 dark:border-log-border rounded mb-3 flex flex-col">' +
+                                        '<div class="flex items-center justify-between">' +
+                                            '<div class="flex items-center gap-4 overflow-hidden">' +
+                                                '<div class="shrink-0 px-2 py-1 rounded text-xs font-medium border ' + statusColor + '">' +
+                                                    statusStr +
+                                                '</div>' +
+                                                '<div class="min-w-0">' + 
+                                                    '<div class="font-mono text-sm font-medium text-gray-900 dark:text-gray-100">' + tId + '</div>' +
+                                                    reasonSnippet + 
+                                                '</div>' +
+                                            '</div>' +
+                                            '<div class="flex items-center gap-2 shrink-0">' +
+                                                controls +
+                                            '</div>' +
+                                        '</div>' +
+                                        errorBlock + 
                                     '</div>';
                         }});
                         container.innerHTML = html;
@@ -1121,6 +1174,70 @@ def project_workspace(project_id: str = Path(...)):
                     await fetch('/api/project/' + pId + '/task/' + taskId + '/terminate', {{ method: 'POST' }});
                     fetchPipeline();
                     fetchCompletedPipeline();
+                }}
+
+                async function syncGithub(event, taskId) {{
+                    const pId = document.getElementById('project-id').value;
+                    const btn = event.currentTarget;
+                    const origHTML = btn.innerHTML;
+                    
+                    btn.innerHTML = "Syncing...";
+                    btn.disabled = true;
+                    btn.classList.add("opacity-50");
+
+                    try {{
+                        const res = await fetch('/api/project/' + pId + '/task/' + taskId + '/sync-github', {{ method: 'POST' }});
+                        const data = await res.json();
+                        alert(data.message);
+                        fetchPipeline(); // Instantly refresh UI to reflect the new synced status
+                    }} catch (err) {{
+                        alert("Network error: Failed to reach the server to sync with GitHub.");
+                    }} finally {{
+                        btn.innerHTML = origHTML;
+                        btn.disabled = false;
+                        btn.classList.remove("opacity-50");
+                    }}
+                }}
+                
+                async function resolveBuild(event, taskId, resolutionType) {{
+                    const pId = document.getElementById('project-id').value;
+                    const btn = event.currentTarget;
+                    const origHTML = btn.innerHTML;
+                    
+                    let feedback = '';
+                    if (resolutionType === 'code_fix') {{
+                        const inputField = document.getElementById('feedback-' + taskId);
+                        if (inputField) {{
+                            feedback = inputField.value;
+                        }}
+                    }}
+
+                    btn.innerHTML = "Waking AI...";
+                    btn.disabled = true;
+                    btn.classList.add("opacity-50");
+
+                    try {{
+                        const res = await fetch('/api/project/' + pId + '/task/' + taskId + '/resolve-build', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json' }},
+                            body: JSON.stringify({{
+                                resolution_type: resolutionType,
+                                human_feedback: feedback
+                            }})
+                        }});
+                        const data = await res.json();
+                        
+                        if (!data.success) {{
+                            alert("Failed: " + data.message);
+                        }}
+                        fetchPipeline(); // Instantly refresh UI
+                    }} catch (err) {{
+                        alert("Network error: Failed to reach the server.");
+                    }} finally {{
+                        btn.innerHTML = origHTML;
+                        btn.disabled = false;
+                        btn.classList.remove("opacity-50");
+                    }}
                 }}
 
                 // Start polling

@@ -158,7 +158,8 @@ def init_pipeline_db():
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP,
                 build_error_log TEXT,
-                latest_commit_sha TEXT
+                latest_commit_sha TEXT,
+                branch_name TEXT
             )
         """)
 
@@ -169,6 +170,11 @@ def init_pipeline_db():
             
         try:
             conn.execute("ALTER TABLE tasks ADD COLUMN latest_commit_sha TEXT")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN branch_name TEXT")
         except sqlite3.OperationalError:
             pass
     
@@ -195,22 +201,29 @@ def get_pipeline_task(task_id: str):
         row = cursor.fetchone()
         return dict(row) if row else None
 
-def update_task_status(task_id: str, new_status: str, error_log: str = None, commit_sha: str = None):
+def update_task_status(task_id: str, new_status: str, error_log: str = None, commit_sha: str = None, branch_name: str = None):
     with sqlite3.connect(PIPELINE_DB_PATH) as conn:
-        if error_log is not None or commit_sha is not None:
-            # Update status AND the new webhook columns
-            conn.execute(
-                """UPDATE tasks 
-                   SET status = ?, updated_at = ?, build_error_log = ?, latest_commit_sha = ? 
-                   WHERE task_id = ?""",
-                (new_status, datetime.utcnow().isoformat(), error_log, commit_sha, task_id)
-            )
-        else:
-            # Standard update (just status and timestamp)
-            conn.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
-                (new_status, datetime.utcnow().isoformat(), task_id)
-            )
+        # Always update status and timestamp
+        updates = ["status = ?", "updated_at = ?"]
+        params = [new_status, datetime.utcnow().isoformat()]
+
+        # Dynamically append optional fields if they are provided
+        if error_log is not None:
+            updates.append("build_error_log = ?")
+            params.append(error_log)
+        if commit_sha is not None:
+            updates.append("latest_commit_sha = ?")
+            params.append(commit_sha)
+        if branch_name is not None:
+            updates.append("branch_name = ?")
+            params.append(branch_name)
+
+        # Append the task_id for the WHERE clause
+        params.append(task_id)
+
+        # Construct and execute the final query
+        query = f"UPDATE tasks SET {', '.join(updates)} WHERE task_id = ?"
+        conn.execute(query, tuple(params))
         conn.commit()
 
 def get_completed_tasks(project_id: str):

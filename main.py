@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from datetime import datetime
 
 # Import from our modularized files
-from database import init_db, init_pipeline_db, PIPELINE_DB_PATH
+from database import init_db, init_pipeline_db, PIPELINE_DB_PATH, update_task_status
 from onboarding import router as onboarding_router, get_vault
 from log_viewer import router as log_viewer_router
 from engine import run_pipeline_task
@@ -113,8 +113,17 @@ async def handle_preview_ready(payload: PreviewPayload):
             headers=headers
         )
 
+    # 4. Extract the task_id from the payload and mark the task as COMPLETE!
+    # (Strips out the branch prefixes to match the database task_id)
+    task_id = payload.ticket_id.replace("feature-", "").replace("wip-", "")
+    
+    try:
+        update_task_status(task_id, "Completed")
+    except Exception as e:
+        print(f"\n[DB ERROR] Failed to mark task {task_id} as completed: {str(e)}")
+
     if response.status_code == 200:
-        return {"status": "success", "message": "Preview URL posted to Linear."}
+        return {"status": "success", "message": "Preview URL posted and task completed."}
     else:
         return {"status": "error", "details": response.text}
 

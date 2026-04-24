@@ -346,16 +346,17 @@ def run_pipeline_task(task_id: str, project_id: str, human_input: str, tenant_co
         # 3. Execute LangGraph agent with the parsed IDs
         process_ticket(task_id, ticket_id, current_session_id, project_id, human_input, tenant_config)
         
-        # 4. If it finishes without crashing, mark as Completed
-        with sqlite3.connect(PIPELINE_DB_PATH) as conn:
-            conn.execute("UPDATE tasks SET status = 'Completed', updated_at = ? WHERE task_id = ?", 
-                         (datetime.utcnow().isoformat(), task_id))
-            conn.commit()
+        # 4. Save the exact branch and transition status in ONE database transaction
+        update_task_status(
+            task_id=task_id, 
+            new_status="AWAITING_PREVIEW", 
+            branch_name=f"feature-{task_id}"
+        )
             
     except Exception as e:
-        print(f"\n[PIPELINE ERROR] Task {task_id} crashed: {str(e)}")
-        # 5. If it crashes, mark as Failed
-        with sqlite3.connect(PIPELINE_DB_PATH) as conn:
-            conn.execute("UPDATE tasks SET status = 'Failed', updated_at = ? WHERE task_id = ?", 
-                         (datetime.utcnow().isoformat(), task_id))
-            conn.commit()
+        # Capture the crash reason
+        error_msg = f"System Crash: {str(e)}"
+        print(f"[PIPELINE ERROR] Task {task_id} crashed: {error_msg}")
+        
+        # Save it to the database using the existing error_log parameter
+        update_task_status(task_id, "Failed", error_log=error_msg)

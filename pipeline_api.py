@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from database import get_active_tasks, get_pipeline_task, update_task_status, get_completed_tasks
 from engine import run_pipeline_task
 from onboarding import get_vault
+import httpx
 
 router = APIRouter()
 
@@ -89,3 +90,64 @@ def api_resolve_build(project_id: str, task_id: str, payload: ResolveBuildPayloa
     background_tasks.add_task(run_pipeline_task, task_id, project_id, new_human_input, tenant_config)
 
     return {"success": True, "message": "Agent resumed successfully."}
+
+@router.post("/api/project/{project_id}/task/{task_id}/sync-github")
+async def api_sync_github_status(project_id: str, task_id: str):
+    task = get_pipeline_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # 1. STATE PERSISTENCE: Read the exact branch from the DB (No guessing!)
+    branch_name = task.get("branch_name") 
+    if not branch_name:
+        # Fallback for tasks created before the DB migration
+        branch_name = f"feature-{task_id}"
+
+    # 2. Dynamically fetch the tenant's specific GitHub credentials
+    vault = get_vault()
+    tenant_config = vault.get(project_id, {})
+    github_token = tenant_config.get("github_token")
+    github_repo = tenant_config.get("github_repo")
+
+    if not github_token or not github_repo:
+        raise HTTPException(status_code=400, detail="GitHub credentials missing for this project.")
+
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    # 3. DETERMINISTIC TARGETING: Query ONLY the specific workflow for this exact branch
+    workflow_filename = "firebase-hosting-pull-request.yml" # Change if your file is named differently
+    runs_url = f"https://api.github.com/repos/{github_repo}/actions/workflows/{workflow_filename}/runs"
+
+    async with httpx.AsyncClient() as client:
+        res = await client.get(runs_url, headers=headers, params={"branch": branch_name, "per_page": 1})
+
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail=f"GitHub API Error: {res.text}")
+
+    data = res.json()
+    if data.get("total_count", 0) == 0:
+        return {"success": False, "message": f"Deployment has not started yet for branch '{branch_name}'.", "status": task.get("status")}
+
+    # 4. Parse the latest deterministic run and sync our database
+    latest_run = data["workflow_runs"][0]
+    run_status = latest_run["status"]
+    conclusion = latest_run["conclusion"]
+    run_url = latest_run["html_url"]
+
+    if run_status != "completed":
+        return {"success": True, "message": "Action is still running on GitHub.", "status": task.get("status")}
+
+    if conclusion == "success":
+        update_task_status(task_id, "Completed")
+        return {"success": True, "message": "Action succeeded! Synced status to Completed.", "status": "Completed"}
+
+    elif conclusion in ["failure", "cancelled", "timed_out"]:
+        error_msg = f"GitHub Action {conclusion}. Please check the logs here: {run_url}"
+        update_task_status(task_id, "BLOCKED_PR_BUILD", error_log=error_msg)
+        return {"success": True, "message": f"Action {conclusion}! Synced status to BLOCKED.", "status": "BLOCKED_PR_BUILD"}
+
+    else:
+        return {"success": True, "message": f"Action ended with status: {conclusion}", "status": task.get("status")}
