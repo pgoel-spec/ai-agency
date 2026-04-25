@@ -146,6 +146,52 @@ async def api_sync_github_status(project_id: str, task_id: str):
 
     elif conclusion in ["failure", "cancelled", "timed_out"]:
         error_msg = f"GitHub Action {conclusion}. Please check the logs here: {run_url}"
+        
+        # --- FETCH ACTUAL TERMINAL LOGS FOR FAILURES ---
+        if conclusion == "failure":
+            jobs_url = latest_run.get("jobs_url")
+            if jobs_url:
+                try:
+                    async with httpx.AsyncClient(follow_redirects=True) as client:
+                        # 1. Get all jobs in this run
+                        jobs_res = await client.get(jobs_url, headers=headers)
+                        if jobs_res.status_code == 200:
+                            jobs_data = jobs_res.json()
+                            
+                            # 2. Find the specific job that failed
+                            for job in jobs_data.get("jobs", []):
+                                if job.get("conclusion") == "failure":
+                                    job_id = job["id"]
+
+                                    # FETCH EXACT UI ERRORS (ANNOTATIONS)
+                                    anno_url = f"https://api.github.com/repos/{github_repo}/check-runs/{job_id}/annotations"
+                                    anno_res = await client.get(anno_url, headers=headers)
+                                    ui_errors = ""
+                                    if anno_res.status_code == 200:
+                                        for ann in anno_res.json():
+                                            if ann.get("annotation_level") == "failure":
+                                                ui_errors += f"File: {ann.get('path')} Line: {ann.get('start_line')}\nError: {ann.get('message')}\n\n"
+                                    
+                                    # FETCH RAW TERMINAL LOGS (AS FALLBACK)
+                                    log_url = f"https://api.github.com/repos/{github_repo}/actions/jobs/{job_id}/logs"
+                                    log_res = await client.get(log_url, headers=headers)
+                                    
+                                    tail_log = "No logs available."
+                                    if log_res.status_code == 200:
+                                        raw_log = log_res.text
+                                        # Grab the last 2500 characters so we don't blow up the AI's context limit
+                                        tail_log = raw_log[-2500:] if len(raw_log) > 2500 else raw_log
+                                        
+                                    # COMBINE THEM FOR THE AI
+                                    error_msg = "GitHub Action Failed.\n\n"
+                                    if ui_errors:
+                                        error_msg += f"=== EXACT UI ERRORS ===\n{ui_errors}\n"
+                                    error_msg += f"=== TERMINAL LOG TAIL ===\n{tail_log}\n\nFull run details: {run_url}"
+                                    break
+                except Exception as e:
+                    print(f"[GITHUB SYNC ERROR] Failed to fetch detailed job logs: {str(e)}")
+        # ----------------------------------------------------
+        
         update_task_status(task_id, "BLOCKED_PR_BUILD", error_log=error_msg)
         return {"success": True, "message": f"Action {conclusion}! Synced status to BLOCKED.", "status": "BLOCKED_PR_BUILD"}
 

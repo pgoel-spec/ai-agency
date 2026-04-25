@@ -61,10 +61,11 @@ build/Release
 sa-key*
 /Dockerfile
 /dockerfile
-test.py
 output
 output/
 tenant_vault.json
 
 /inspect_db.py
 /backup.py
+/reset.py
+test.py

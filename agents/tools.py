@@ -831,7 +831,12 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
         git config --global user.name "AI DevOps"
         
         git add .
-        git commit -m "$COMMIT_MSG" || echo "nothing to commit"
+        
+        # Use --allow-empty to force a commit even if no files changed.
+        # This guarantees GitHub Actions CI/CD will re-trigger if the user 
+        # manually resolves an infrastructure issue.
+        git commit --allow-empty -m "$COMMIT_MSG"
+
         git push https://$GITHUB_TOKEN@github.com/{repo_full}.git HEAD:refs/heads/{active_resume_branch} --force
         """
         
@@ -861,7 +866,11 @@ def create_github_pr(ticket_id: str, commit_message: str, pr_title: str, pr_body
         git config --global user.name "AI DevOps"
         git checkout -b {new_branch}
         git add .
-        git commit -m "$COMMIT_MSG"
+        
+        # Use --allow-empty to ensure the initial PR push succeeds and triggers CI/CD
+        # even if the AI's first action didn't actually modify any files.
+        git commit --allow-empty -m "$COMMIT_MSG"
+        
         git push https://$GITHUB_TOKEN@github.com/{repo_full}.git {new_branch}
         """
         

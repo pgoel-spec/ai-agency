@@ -23,6 +23,18 @@ def get_db_conn():
         # This guarantees the file descriptor is released back to the OS
         conn.close()
 
+@contextmanager
+def get_pipeline_conn():
+    """Helper for pipeline.db to prevent locks during concurrent ticket processing."""
+    conn = sqlite3.connect(PIPELINE_DB_PATH, timeout=15)
+    try:
+        # Enable Write-Ahead Logging for concurrent reads and writes
+        conn.execute('PRAGMA journal_mode=WAL;')
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
 def init_db():
     with get_db_conn() as conn:
         # Enable concurrent reads and writes
@@ -148,7 +160,7 @@ def get_sessions_by_project(project_id: str):
 
 def init_pipeline_db():
     """Initializes the persistent task queue database."""
-    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+    with get_pipeline_conn() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id TEXT PRIMARY KEY,
@@ -182,7 +194,7 @@ def init_pipeline_db():
 
 def get_active_tasks(project_id: str):
     """Fetches all tasks that are currently Pending, Running, Failed, or BLOCKED_PR_BUILD."""
-    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+    with get_pipeline_conn() as conn:
         conn.row_factory = sqlite3.Row  # This lets us return dicts easily
         cursor = conn.cursor()
         cursor.execute(
@@ -194,7 +206,7 @@ def get_active_tasks(project_id: str):
         return [dict(row) for row in cursor.fetchall()]
 
 def get_pipeline_task(task_id: str):
-    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+    with get_pipeline_conn() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
@@ -202,7 +214,7 @@ def get_pipeline_task(task_id: str):
         return dict(row) if row else None
 
 def update_task_status(task_id: str, new_status: str, error_log: str = None, commit_sha: str = None, branch_name: str = None):
-    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+    with get_pipeline_conn() as conn:
         # Always update status and timestamp
         updates = ["status = ?", "updated_at = ?"]
         params = [new_status, datetime.utcnow().isoformat()]
@@ -228,7 +240,7 @@ def update_task_status(task_id: str, new_status: str, error_log: str = None, com
 
 def get_completed_tasks(project_id: str):
     """Fetches all tasks that have finished or been dismissed."""
-    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+    with get_pipeline_conn() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute(

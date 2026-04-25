@@ -7,7 +7,7 @@ from agents.graph import workflow
 from langgraph.checkpoint.sqlite import SqliteSaver
 from agents.tools import get_best_resume_branch
 from langchain_core.messages import HumanMessage
-from database import log_activity, PIPELINE_DB_PATH
+from database import log_activity, PIPELINE_DB_PATH, update_task_status
 
 def get_recent_linear_comments(ticket_id: str, linear_token: str) -> str:
     """
@@ -337,10 +337,7 @@ def run_pipeline_task(task_id: str, project_id: str, human_input: str, tenant_co
     ticket_id = "-".join(parts[:-1])               
 
     # 2. Mark task as Running
-    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
-        conn.execute("UPDATE tasks SET status = 'Running', updated_at = ? WHERE task_id = ?", 
-                     (datetime.utcnow().isoformat(), task_id))
-        conn.commit()
+    update_task_status(task_id, "Running")
     
     try:
         # 3. Execute LangGraph agent with the parsed IDs

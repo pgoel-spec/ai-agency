@@ -70,8 +70,14 @@ def delete_project_record(project_id: str):
 # 2. GITHUB INJECTOR
 # ==========================================
 async def inject_github_workflow(project_id: str, github_repo: str, github_token: str):
-    saas_url = os.getenv("LINEAR_REDIRECT_URI", "").replace("/auth/linear/callback", "/webhooks/preview-ready")
-    if not saas_url: saas_url = "https://api.yoursaas.com/webhooks/preview-ready"
+    linear_uri = os.getenv("LINEAR_REDIRECT_URI")
+    
+    # If there is no domain configured, abort the webhook injection.
+    if not linear_uri:
+        print("[ERROR] Missing LINEAR_REDIRECT_URI in .env. Cannot inject GitHub webhook.")
+        return False
+        
+    saas_url = linear_uri.replace("/auth/linear/callback", "/webhooks/preview-ready")
 
     workflow_yaml = f"""name: Notify AI Agency of Preview
 on: pull_request
@@ -97,7 +103,7 @@ jobs:
         if get_resp.status_code == 200:
             payload["sha"] = get_resp.json().get("sha")
         response = await client.put(url, headers=headers, json=payload)
-    return response.status_code in (200, 201) 
+    return response.status_code in (200, 201)
 
 # ==========================================
 # 3. API ENDPOINTS
@@ -367,7 +373,16 @@ def generate_card_html(proj_id, data):
     """
 
 def get_modal_html():
-    return """
+    # Dynamically grab the base domain from the environment
+    base_uri = os.getenv("LINEAR_REDIRECT_URI", "")
+    if not base_uri:
+        # A clear, human-readable placeholder if the env var is missing
+        webhook_target = "https://<YOUR_DOMAIN_OR_NGROK>/webhooks/pr-build-failed"
+    else:
+        # Strip the linear path to get the base domain, then append the webhook route
+        webhook_target = base_uri.replace("/auth/linear/callback", "/webhooks/pr-build-failed")
+
+    return f"""
     <div id="onboard-modal" class="fixed inset-0 bg-gray-900 bg-opacity-60 overflow-y-auto h-full w-full hidden z-50 flex items-center justify-center">
         <div class="bg-white dark:bg-log-surface p-8 rounded-xl shadow-2xl max-w-md w-full relative h-[650px] flex flex-col transition-colors border border-transparent dark:border-log-border">
             <button onclick="closeModal()" class="absolute top-4 right-4 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">
@@ -406,12 +421,31 @@ def get_modal_html():
                         <p class="text-xs text-gray-500 mb-2">Paste this snippet at the very end of your deployment <code>.yml</code> file:</p>
                         <textarea id="yaml-template" class="hidden">      - name: Report Build Failure to AI Agency
         if: failure()
+        env:
+          GH_TOKEN: ${{{{ github.token }}}}
         run: |
-          ERROR_LOG=$(tail -c 3000 /home/runner/work/.../build.log || echo "Check Actions UI")
+          # 1. Smart Extractor: Look for a trapped build.log file first
+          BUILD_LOG_PATH=$(find . -name "build.log" | head -n 1)
+          
+          if [ -n "$BUILD_LOG_PATH" ]; then
+            RAW_LOG=$(tail -c 2500 "$BUILD_LOG_PATH")
+            LOG_SOURCE="Extracted from $BUILD_LOG_PATH"
+          else
+            # 2. Fallback: Use GitHub CLI to grab native terminal stdout
+            RAW_LOG=$(gh run view ${{{{ github.run_id }}}} --log-failed | tail -c 2500 || echo "Failed to fetch native logs.")
+            LOG_SOURCE="Extracted from GitHub Native Logs"
+          fi
+          
+          # 3. Format cleanly for the AI Prompt
+          ERROR_LOG="=== LOG SOURCE: $LOG_SOURCE ===
+          $RAW_LOG"
+          
+          ESCAPED_LOG=$(echo "$ERROR_LOG" | jq -Rs .)
+          
           curl -X POST -H "Content-Type: application/json" \\
-          -H "X-Agency-Signature: ${{ secrets.AGENCY_WEBHOOK_SECRET }}" \\
-          -d "{\"tenant_id\": \"__TENANT_ID__\", \"branch_name\": \"${{ github.head_ref || github.ref_name }}\", \"commit_sha\": \"${{ github.sha }}\", \"error_log\": \"$ERROR_LOG\"}" \\
-          https://api.yoursaas.com/webhooks/pr-build-failed</textarea>
+          -H "X-Agency-Signature: ${{{{ secrets.AGENCY_WEBHOOK_SECRET }}}}" \\
+          -d "{{\\"tenant_id\\": \\"__TENANT_ID__\\", \\"branch_name\\": \\"${{{{ github.head_ref || github.ref_name }}}}\\", \\"commit_sha\\": \\"${{{{ github.sha }}}}\\", \\"error_log\\": $ESCAPED_LOG}}" \\
+          {webhook_target}</textarea>
                         <pre class="bg-gray-900 text-gray-300 p-3 rounded-lg text-xs overflow-x-auto border border-gray-700 font-mono leading-relaxed"><code id="yaml-snippet-code">Save project first to generate code...</code></pre>
                     </div>
                 </div>
@@ -854,9 +888,15 @@ async def linear_callback(state: str, code: str = None, error: str = None):
     
     # Automatically register the webhook in Linear (No duplicates)
     # We dynamically build the webhook URL using your existing redirect URI
-    saas_webhook_url = os.getenv("LINEAR_REDIRECT_URI", "").replace("/auth/linear/callback", "/webhook")
+    base_uri = os.getenv("LINEAR_REDIRECT_URI", "")
     
-    if saas_webhook_url:
+    # Do not attempt to register a webhook if we don't know our own domain.
+    if not base_uri:
+        print("[ERROR] Missing LINEAR_REDIRECT_URI in .env. Skipping Linear webhook registration.")
+    else:
+        base_webhook = base_uri.replace("/auth/linear/callback", "/webhook")
+        saas_webhook_url = f"{base_webhook}?project_id={state}"
+
         async with httpx.AsyncClient() as client:
             # Check if we already have a webhook for this URL
             check_query = "{ webhooks { nodes { id url } } }"
@@ -1008,11 +1048,23 @@ def project_workspace(project_id: str = Path(...)):
             </div>
 
             <script>
+                // Cache variables to prevent unnecessary re-renders
+                let lastPipelinePayload = "";
+                let lastCompletedPayload = "";
+
                 async function fetchPipeline() {{
                     const pId = document.getElementById('project-id').value;
                     try {{
                         const res = await fetch('/api/project/' + pId + '/pipeline');
                         const data = await res.json();
+                        
+                        // Only re-render if the data actually changed
+                        const currentPayload = JSON.stringify(data.tasks || []);
+                        if (currentPayload === lastPipelinePayload) {{
+                            return; // Exit silently without wiping the DOM
+                        }}
+                        lastPipelinePayload = currentPayload;
+
                         const container = document.getElementById('pipeline-container');
                         
                         if (!data.tasks || data.tasks.length === 0) {{
@@ -1051,7 +1103,7 @@ def project_workspace(project_id: str = Path(...)):
                             if (task.status === "Failed") statusColor = "text-red-600 bg-red-50 dark:bg-red-900/20 border-red-200";
                             else if (task.status === "BLOCKED_PR_BUILD") statusColor = "text-orange-600 bg-orange-50 dark:bg-orange-900/20 border-orange-200";
 
-                            // --- NEW: 1-Line Status Reason Snippet ---
+                            // --- 1-Line Status Reason Snippet ---
                             let reasonSnippet = '';
                             if (task.build_error_log) {{
                                 let cleanLog = task.build_error_log.replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -1121,6 +1173,14 @@ def project_workspace(project_id: str = Path(...)):
                     try {{
                         const res = await fetch('/api/project/' + pId + '/pipeline/completed');
                         const data = await res.json();
+                        
+                        // Only re-render if the data actually changed
+                        const currentPayload = JSON.stringify(data.tasks || []);
+                        if (currentPayload === lastCompletedPayload) {{
+                            return; // Exit silently
+                        }}
+                        lastCompletedPayload = currentPayload;
+
                         const container = document.getElementById('completed-pipeline-container');
 
                         if (!data.tasks || data.tasks.length === 0) {{

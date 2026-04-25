@@ -10,22 +10,22 @@ from pydantic import BaseModel
 from datetime import datetime
 
 # Import from our modularized files
-from database import init_db, init_pipeline_db, PIPELINE_DB_PATH, update_task_status
+from database import init_db, init_pipeline_db, get_pipeline_conn
 from onboarding import router as onboarding_router, get_vault
 from log_viewer import router as log_viewer_router
 from engine import run_pipeline_task
 from pipeline_api import router as pipeline_router
-from webhook_handler import process_github_webhook, WebhookSecurityError
+from webhook_handler import process_github_webhook, process_preview_ready, WebhookSecurityError
 
 load_dotenv() # Load the .env file so the API keys are available to the tools
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- ON STARTUP ---
-    init_db()          # Your original DB init
-    init_pipeline_db() # Our new pipeline DB init
+    init_db()          # DB init
+    init_pipeline_db() # Pipeline DB init
     
-    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+    with get_pipeline_conn() as conn:
         cursor = conn.cursor()
         # Find any tasks left "Running" from a previous crash/Ctrl+C
         cursor.execute(
@@ -33,7 +33,6 @@ async def lifespan(app: FastAPI):
             (datetime.utcnow().isoformat(),)
         )
         zombies = cursor.rowcount
-        conn.commit()
         if zombies > 0:
             print(f"\n[PIPELINE] 🧹 Swept {zombies} zombie task(s) back to 'Pending'.")
             
@@ -56,76 +55,13 @@ class PreviewPayload(BaseModel):
 
 @app.post("/webhooks/preview-ready")
 async def handle_preview_ready(payload: PreviewPayload):
-    """
-    Called by GitHub Actions when a Firebase Preview is successfully deployed.
-    Routes the URL to the correct Linear ticket using the tenant's OAuth token.
-    """
-    # 1. Fetch the vault using our central helper!
-    vault = get_vault()
-        
-    tenant_data = vault.get(payload.tenant_id)
-    if not tenant_data:
-        return {"error": f"Project {payload.tenant_id} not found in vault"}
-    
-    # Check the toggle
-    if not tenant_data.get("is_active", True):
-        return {"status": "ignored", "message": "Project is currently paused."}
-
-    # Fallback to the old api_key if they haven't migrated to OAuth yet
-    linear_token = tenant_data.get("linear_access_token") or tenant_data.get("linear_api_key")
-    if not linear_token:
-        return {"error": "No Linear token found for tenant"}
-
-    # Parse using the underscore
-    if "_" in payload.ticket_id:
-        # Splits "feature-ai-agency-ws_AI-6-1774207968" -> "AI-6-1774207968"
-        after_underscore = payload.ticket_id.split("_")[-1] 
-        parts = after_underscore.split("-")
-        
-        # Rejoin just the "AI" and "6"
-        linear_issue_id = f"{parts[0]}-{parts[1]}" if len(parts) >= 2 else after_underscore
-    else:
-        linear_issue_id = payload.ticket_id
-
-    # 2. Construct the GraphQL mutation for Linear
-    graphql_query = """
-    mutation commentCreate($issueId: String!, $body: String!) {
-      commentCreate(input: { issueId: $issueId, body: $body }) {
-        success
-      }
-    }
-    """
-    variables = {
-        "issueId": linear_issue_id,
-        "body": f"🚀 **Live Preview Ready:** {payload.preview_url}\n\n*Deployed automatically by AI Agency Developer.*"
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {linear_token}" # OAuth tokens use Bearer
-    }
-
-    # 3. Post the comment to Linear
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://api.linear.app/graphql",
-            json={"query": graphql_query, "variables": variables},
-            headers=headers
-        )
-
-    # 4. Extract the task_id from the payload and mark the task as COMPLETE!
-    # (Strips out the branch prefixes to match the database task_id)
-    task_id = payload.ticket_id.replace("feature-", "").replace("wip-", "")
-    
-    try:
-        update_task_status(task_id, "Completed")
-    except Exception as e:
-        print(f"\n[DB ERROR] Failed to mark task {task_id} as completed: {str(e)}")
-
-    if response.status_code == 200:
-        return {"status": "success", "message": "Preview URL posted and task completed."}
-    else:
-        return {"status": "error", "details": response.text}
+    return await process_preview_ready(
+        tenant_id=payload.tenant_id,
+        ticket_id=payload.ticket_id,
+        preview_url=payload.preview_url,
+        get_vault_func=get_vault,
+        update_db_func=lambda t_id, status: update_task_status(t_id, status)
+    )
 
 @app.post("/webhooks/pr-build-failed")
 async def fastapi_adapter(request: Request, x_agency_signature: str = Header(None)):
@@ -135,8 +71,9 @@ async def fastapi_adapter(request: Request, x_agency_signature: str = Header(Non
         result = process_github_webhook(
             raw_body=raw_body,
             signature_header=x_agency_signature,
-            get_tenant_secret_func=my_vault_lookup_function,
-            update_db_func=my_database_update_function
+            # Map directly to existing helpers via lambdas
+            get_tenant_secret_func=lambda t_id: get_vault().get(t_id, {}).get("webhook_secret"),
+            update_db_func=lambda t_id, log, sha: update_task_status(t_id, "BLOCKED_PR_BUILD", error_log=log, commit_sha=sha)
         )
         return result
     except WebhookSecurityError as e:
@@ -146,24 +83,17 @@ async def fastapi_adapter(request: Request, x_agency_signature: str = Header(Non
 async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
     
-    # --- 1. Map to your internal Project ID ---
-    vault = await asyncio.to_thread(get_vault)
-    linear_org_id = payload.get("organizationId")
-    project_id = None
+    # Fail-Fast Filter: Only process creations, ignore background syncs
+    action = payload.get("action")
+    if action != "create":
+        return {"status": "Ignored", "message": f"Ignoring webhook with action: {action}"}
 
-    # Search the vault for the project matching this Linear Organization
-    for pid, data in vault.items():
-        if data.get("linear_org_id") == linear_org_id:
-            project_id = pid
-            break
-            
-    # Fallback for legacy records that haven't re-authenticated
-    if not project_id:
-        legacy_team_id = payload.get("data", {}).get("teamId", "DEFAULT_TEAM")
-        if legacy_team_id in vault:
-            project_id = legacy_team_id
-        else:
-            return {"status": "Ignored", "message": "Unrecognized Linear Organization or Team."}
+    # --- 1. Map to your internal Project ID DIRECTLY FROM THE URL ---
+    project_id = request.query_params.get("project_id")
+    
+    vault = await asyncio.to_thread(get_vault)
+    if not project_id or project_id not in vault:
+        return {"status": "Ignored", "message": f"Invalid or missing project_id in webhook URL."}
     
     # Safely load the config and check the toggle
     tenant_config = vault.get(project_id, {})
@@ -204,13 +134,13 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
         human_input = (
             f"New Task Assigned: {ticket_title}\n\n"
             f"Description: {ticket_description}\n\n"
-            f"IMPORTANT: The active Linear Ticket ID for this task is {ticket_id}.\n"
-            f"IMPORTANT: Do not guess or invent a repository URL. Use the environment variable $GITHUB_REPO.\n"
+            f"---\n"
+            f"*Initialized automatically via Linear webhook.*"
         )
 
     # --- 4. PIPELINE QUEUE: Insert the Database Row ---
     now = datetime.utcnow().isoformat()
-    with sqlite3.connect(PIPELINE_DB_PATH) as conn:
+    with get_pipeline_conn() as conn:
         cursor = conn.cursor()
         
         # Check for concurrency using the base ticket_id
