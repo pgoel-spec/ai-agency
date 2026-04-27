@@ -11,9 +11,9 @@ from .state import AgencyState, DEVELOPER_ITERATION_LIMIT
 from .tools import (
     update_linear_ticket, create_github_pr, run_terminal_command, 
     read_file, write_file, sync_wip_commit, web_search, generate_repo_map,
-    run_backend_test, run_frontend_test, run_unit_tests
+    run_backend_test, run_frontend_test, run_unit_tests, update_technical_plan
 )
-from database import get_logs_by_ticket, log_activity
+from database import get_logs_by_ticket, log_activity, get_formatted_technical_plan
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -64,6 +64,7 @@ def safe_invoke_llm(llm, prompt_list):
 class RouteDecision(BaseModel):
     """Call this tool to route the task to the next appropriate team member."""
     reasoning: str = Field(description="Your step-by-step reasoning for why you are choosing this agent.")
+    instructions: str = Field(description="Explicit instructions, architectural constraints, or warnings from the Graveyard to pass to the next agent.")
     next_agent: str = Field(description="The name of the agent to route to. Must be 'Developer', 'DevOps', or 'FINISH'.")
 
 class ReportStatus(BaseModel):
@@ -78,8 +79,8 @@ class DevOpsReport(BaseModel):
     status: str = Field(description="Must be 'IN_PROGRESS' or 'COMPLETE'")
     pr_url: str = Field(description="The URL of the created PR, if applicable.", default="")
 
-manager_tools = [RouteDecision, update_linear_ticket]
-developer_tools = [ReportStatus, run_terminal_command, read_file, write_file, sync_wip_commit, run_backend_test, run_frontend_test, run_unit_tests, web_search, generate_repo_map]
+manager_tools = [RouteDecision, update_linear_ticket, update_technical_plan, generate_repo_map]
+developer_tools = [ReportStatus, run_terminal_command, read_file, write_file, sync_wip_commit, run_backend_test, run_frontend_test, run_unit_tests, web_search, generate_repo_map, update_technical_plan]
 devops_tools = [DevOpsReport, create_github_pr]
 
 # Initialize the Models via Vertex AI with JSON enforcement
@@ -148,7 +149,7 @@ def get_tool_names(tools_list) -> list:
 # Helper function for Filtering
 def filter_agent_history(messages: list, agent_role: str) -> list:
     """Filters history so an agent only sees the Human request and its own past actions.
-    Includes Progressive Memory Management to prevent token limits from being exceeded."""
+    Includes 3-Pillar Pruning (Sandbox Resets, PR Checkpoints) and Progressive Memory Management."""
     
     dev_tool_names = get_tool_names(developer_tools)
     devops_tool_names = get_tool_names(devops_tools)
@@ -163,12 +164,62 @@ def filter_agent_history(messages: list, agent_role: str) -> list:
     elif agent_role == "Manager":
         allowed_tools = manager_tool_names + ["ReportStatus", "DevOpsReport"]
     
+    # =========================================================
+    # PRE-PROCESSING: Convert tuples so filtering is consistent
+    # =========================================================
+    norm_messages = []
+    for msg in messages:
+        if isinstance(msg, tuple):
+            m_type, m_content = msg[0], msg[1]
+            if m_type in ["user", "human"]:
+                norm_messages.append(HumanMessage(content=m_content))
+            elif m_type == "ai":
+                norm_messages.append(AIMessage(content=m_content))
+            else:
+                continue # Skip unknown tuple types
+        else:
+            norm_messages.append(msg)
+
+    # ---------------------------------------------------------
+    # PILLAR 1: SANDBOX RESETS
+    # ---------------------------------------------------------
+    last_override_idx = -1
+    for i in range(len(norm_messages) - 1, -1, -1):
+        if getattr(norm_messages[i], "type", "") == "human" and "SYSTEM OVERRIDE" in str(norm_messages[i].content):
+            last_override_idx = i
+            break
+            
+    if last_override_idx != -1:
+        norm_messages = norm_messages[last_override_idx:]
+
+    # ---------------------------------------------------------
+    # PILLAR 2: PR CHECKPOINTS
+    # ---------------------------------------------------------
+    last_pr_idx = -1
+    for i in range(len(norm_messages) - 1, -1, -1):
+        if getattr(norm_messages[i], "name", "") == "Broadcast" and "Code pushed" in str(norm_messages[i].content):
+            last_pr_idx = i
+            break
+            
+    if last_pr_idx != -1:
+        checkpointed = []
+        for i, msg in enumerate(norm_messages):
+            if i < last_pr_idx:
+                # Before the PR: Keep Human instructions and Manager directions. Drop AI and Tools.
+                m_type = getattr(msg, "type", "")
+                m_name = getattr(msg, "name", "")
+                if m_type == "human" or m_name in ["Manager", "Broadcast"]:
+                    checkpointed.append(msg)
+            else:
+                checkpointed.append(msg)
+        norm_messages = checkpointed
+
     # ---------------------------------------------------------
     # SESSION BOUNDARY
     # We explicitly look for the "source": "webhook" tag in additional_kwargs.
     # ---------------------------------------------------------
     last_real_human_index = -1
-    for i, msg in enumerate(messages):
+    for i, msg in enumerate(norm_messages):
         # Safely get kwargs whether it's an object or tuple
         kwargs = getattr(msg, "additional_kwargs", {})
         
@@ -181,17 +232,7 @@ def filter_agent_history(messages: list, agent_role: str) -> list:
     # ---------------------------------------------------------
     # PHASE 1: STANDARD FILTERING (Role Isolation)
     # ---------------------------------------------------------
-    for i, msg in enumerate(messages):
-        # Convert tuples to objects immediately so logic is consistent
-        if isinstance(msg, tuple):
-            m_type, m_content = msg[0], msg[1]
-            if m_type in ["user", "human"]:
-                msg = HumanMessage(content=m_content)
-            elif m_type == "ai":
-                msg = AIMessage(content=m_content)
-            else:
-                continue # Skip unknown tuple types
-
+    for i, msg in enumerate(norm_messages):
         msg_type = getattr(msg, "type", "")
         msg_kwargs = getattr(msg, "additional_kwargs", {})
         
@@ -242,6 +283,7 @@ def filter_agent_history(messages: list, agent_role: str) -> list:
             # it's from an old session. Strip the signature to save tokens!
             if last_real_human_index != -1 and i < last_real_human_index:
                 kwargs_copy.pop("__gemini_function_call_thought_signatures__", None)
+                kwargs_copy.pop("signature", None)
 
             # Create a BRAND NEW message to bypass Pydantic mutation blocks
             new_msg = AIMessage(
@@ -487,21 +529,24 @@ def manager_node(state: AgencyState) -> dict:
         status_warning = "\n[SYSTEM WARNING]: The Developer was working but hit an iteration limit or timeout before calling ReportStatus. They are currently IN_PROGRESS. Route back to them so they can finish the job.\n"
 
     # 7. The Intelligent Prompt
+    # Fetch Manager's view of the Technical plan
+    plan_injection = get_formatted_technical_plan(state.get("project_id", "UNKNOWN"), "Manager")
+
     system_prompt = SystemMessage(content=(
         f"You are an intelligent Engineering Manager coordinating an AI team.\n\n"
-        f"TEAM REGISTRY:\n{json.dumps(available_agents, indent=2)}\n\n"
         
-        f"--- ORIGINAL CLIENT REQUEST ---\n"
-        f"{original_task}\n\n"
-        
-        f"--- ACTIVE SYSTEM STATUS ---\n"
-        f"SYSTEM OVERRIDE: {active_system_override}\n\n"
-
-        f"--- TEAM WORK LOG ---\n"
-        f"{work_log_str}\n"
-        f"{status_warning}\n" # Reset dev_iteration_count if this is uncommented to prevent infinite loops
-        f"{detailed_debug_context}\n"
+        # 1. IMMEDIATE CONTEXT FIRST (Highly Volatile)
+        f"--- ORIGINAL CLIENT REQUEST ---\n{original_task}\n\n"
+        f"--- SYSTEM OVERRIDE ---\n{active_system_override}\n\n"
+        f"--- TEAM WORK LOG ---\n{work_log_str}\n{status_warning}\n{detailed_debug_context}\n"
         f"--------------------------------------------------\n\n"
+        # Reset dev_iteration_count if this is uncommented to prevent infinite loops
+
+        # 2. LONG-TERM CONTEXT SECOND (Static/Historical)
+        f"{plan_injection}\n"
+
+        # 3. CAPABILITIES
+        f"TEAM REGISTRY:\n{json.dumps(available_agents, indent=2)}\n\n"
         
         "--- ENVIRONMENTAL CONSTRAINTS ---\n"
         "The Developer operates in a headless, non-interactive Linux sandbox. They CANNOT execute commands that require a web browser or terminal user input (e.g., `[Y/n]` prompts, `firebase login`, `aws configure`, `npm login`).\n"
@@ -511,21 +556,27 @@ def manager_node(state: AgencyState) -> dict:
         "1. Read the Team Work Log from top to bottom. This is a chronological log and the last step is the current state of the project.\n"
         "2. Read the Original Client Request and compare it against the Team Work Log.\n"
         "3. If the [CRITICAL AUDIT] block is present, perform a deep-dive analysis of the raw logs to unblock the developer.\n"
-        "4. Intelligently deduce the current state of the project and what needs to happen next.\n\n"
+        "4. Intelligently deduce the current state of the project and what needs to happen next.\n"
 
         "ROUTING RULES (Evaluate from top to bottom):\n"
-        "1. SCOPE CREEP VS REVISIONS (CRITICAL): If there is a SYSTEM OVERRIDE showing an open PR, you MUST evaluate the Original Client Request. If the request is a tweak, bug fix, or direct revision to the current feature, route to 'Developer'. If the request is a completely new, unrelated feature, use `update_linear_ticket` to reply: 'I have already submitted a Pull Request for this ticket. To avoid Git conflicts and keep our work organized, please open a new Linear ticket for this new feature.' Then route to 'FINISH'.\n"
-        "2. TIMEOUT RECOVERY: If you see a [SYSTEM WARNING] that the Developer hit a timeout, route back to the 'Developer' immediately so they can finish their thought.\n"
-        "3. DISCOVERY & MAPPING: If the Developer is still exploring the file structure or reading core configuration files to build a 'System Map', route to 'Developer' to allow them to finish their architectural analysis.\n"
-        "4. RESUMING WORK: If the human replied to a BLOCKED ticket, evaluate whether the codebase requires modifications based on their message:\n"
+        "1. ARCHITECTURE & CLASSIFICATION (NEW TICKETS): When receiving a new request, check the SYSTEM ARCHITECTURE. If it says 'No architecture defined yet', you MUST use `generate_repo_map` to analyze the codebase, then use `update_technical_plan` (section='system_architecture', action='overwrite') to establish the global tech stack. Next, classify the ticket (section='ticket_type') as 'FEATURE' or 'BUG', create the Developer's checklist (section='active_ticket'), and route to the Developer. You can batch these tool calls.\n"
+        "2. DEVELOPER ROUTING (TECHNICAL EVALUATION):\n"
+        "   - When routing to the Developer, evaluate the Technical Plan sections provided above.\n"
+        "   - IF BUG: Review 'EXPLORED APPROACHES' and synthesize the top 3 failed attempts into your `instructions` so the Developer avoids them.\n"
+        "   - IF FEATURE: Review 'SYSTEM ARCHITECTURE' and 'CHANGELOG' to provide instructions on existing patterns they must follow.\n"
+        "3. SYSTEM ALERTS (DOC SYNC): If the Team Work Log contains a 'SYSTEM ALERT' that a PR was MERGED, use `update_technical_plan` to update the 'system_architecture' and 'changelog', then route to 'FINISH'. If the alert says it was DISCARDED, log it to 'explored_approaches' and route to 'FINISH'.\n"
+        "4. SCOPE CREEP VS REVISIONS (CRITICAL): If there is a SYSTEM OVERRIDE showing an open PR, you MUST evaluate the Original Client Request. If the request is a tweak, bug fix, or direct revision to the current feature, route to 'Developer'. If the request is a completely new, unrelated feature, use `update_linear_ticket` to reply: 'I have already submitted a Pull Request for this ticket. To avoid Git conflicts and keep our work organized, please open a new Linear ticket for this new feature.' Then route to 'FINISH'.\n"
+        "5. TIMEOUT RECOVERY: If you see a [SYSTEM WARNING] that the Developer hit a timeout, route back to the 'Developer' immediately so they can finish their thought.\n"
+        "6. DISCOVERY & MAPPING: If the Developer is still exploring the file structure or reading core configuration files to build a 'System Map', route to 'Developer' to allow them to finish their architectural analysis.\n"
+        "7. RESUMING WORK: If the human replied to a BLOCKED ticket, evaluate whether the codebase requires modifications based on their message:\n"
         "   - CODE FIX NEEDED: If new code needs to be written, debugged, or fixed based on the human's feedback and logs, route to the 'Developer' to resume work.\n"
         "   - DEPLOYMENT ONLY: If the code is already fine, no new code is needed, and ONLY a deployment/push is required (e.g., the human manually resolved an external configuration or infrastructure issue), route directly to 'DevOps'.\n"
-        "5. EMERGENCY WIP SAVE: If the Developer is 'BLOCKED' and DevOps has not saved the code yet: Route to 'DevOps' for an emergency WIP commit.\n"
-        "6. SLEEP (WIP SAVED): If DevOps just reported pushing a 'WIP BLOCKED PR', the code is safely saved.  Use `update_linear_ticket` to relay the exact instructions/blocker to the human, then Route to 'FINISH' to sleep until the human acts.\n"
-        "7. FINALIZING CODE: If the Developer's status is 'COMPLETE', route to 'DevOps' to push the final code and create a production Pull Request.\n"
-        "8. SLEEP (PROJECT DONE): If DevOps has created the final Pull Request, use `update_linear_ticket` to notify the human of success, then route to 'FINISH'.\n"
-        "9. STANDARD BUILD: If none of the above apply, and the core feature still needs to be built or is 'IN_PROGRESS', route to the 'Developer'.\n"
-        "10. IMPORTANT: `RouteDecision` is a handoff tool which must be called in a separate, final turn. DO NOT call `RouteDecision` in the same turn as any other tool.\n\n"
+        "8. EMERGENCY WIP SAVE: If the Developer is 'BLOCKED' and DevOps has not saved the code yet: Route to 'DevOps' for an emergency WIP commit.\n"
+        "9. SLEEP (WIP SAVED): If DevOps just reported pushing a 'WIP BLOCKED PR', the code is safely saved.  Use `update_linear_ticket` to relay the exact instructions/blocker to the human, then Route to 'FINISH' to sleep until the human acts.\n"
+        "10. FINALIZING CODE: If the Developer's status is 'COMPLETE', route to 'DevOps' to push the final code and create a production Pull Request.\n"
+        "11. SLEEP (PROJECT DONE): If DevOps has created the final Pull Request, use `update_linear_ticket` to notify the human of success, then route to 'FINISH'.\n"
+        "12. STANDARD BUILD: If none of the above apply, and the core feature still needs to be built or is 'IN_PROGRESS', route to the 'Developer'.\n"
+        "13. IMPORTANT: `RouteDecision` is a handoff tool which must be called in a separate, final turn. DO NOT call `RouteDecision` in the same turn as any other tool.\n\n"
     ))
 
     # ---------------------------------------------------------
@@ -623,10 +674,22 @@ def manager_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
                     name=tool["name"], 
                     tool_call_id=tool["id"]
                 ))
+            
+            elif tool["name"] == "update_technical_plan":
+                tool_config = copy.deepcopy(config)
+                # Inject RBAC identity
+                tool_config["configurable"]["agent_role"] = "Manager"
+                result = update_technical_plan.invoke(tool["args"], config=tool_config)
+                messages_to_add.append(ToolMessage(
+                    content=str(result), 
+                    name=tool["name"], 
+                    tool_call_id=tool["id"]
+                ))
                     
             elif tool["name"] == "RouteDecision":
                 next_agent = tool["args"].get("next_agent", "FINISH")
                 reasoning = tool["args"].get("reasoning", "No reasoning provided.")
+                instructions = tool["args"].get("instructions", "Proceed with your task.")
                 # print(f"\n[Intelligent Manager Routing]: {next_agent}\nReasoning: {reasoning}\n")
                 
                 # Add the ToolMessage to satisfy the LLM API
@@ -638,7 +701,7 @@ def manager_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
 
                 # Add the HumanMessage so downstream agents can see the direction
                 routing_msg = HumanMessage(
-                    content=f"MANAGER DIRECTION: Routing to {next_agent}. Reason: {reasoning}",
+                    content=f"MANAGER DIRECTION: Routing to {next_agent}.\n\nINSTRUCTIONS TO AGENT:\n{instructions}",
                     name="Manager",
                     additional_kwargs={"timestamp": get_short_time()}
                 )
@@ -741,7 +804,8 @@ def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
         "run_frontend_test": run_frontend_test,
         "run_unit_tests": run_unit_tests,
         "web_search": web_search,
-        "generate_repo_map": generate_repo_map
+        "generate_repo_map": generate_repo_map,
+        "update_technical_plan": update_technical_plan
     }
 
     # Fetch existing status
@@ -805,6 +869,9 @@ def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
                     has_verified = True  
             # -----------------------------------
 
+            # Set RBAC identity
+            config["configurable"]["agent_role"] = "Developer"
+            
             # Dynamically execute actual tools
             if tool_name in tool_map:
                 args = tool["args"].copy()

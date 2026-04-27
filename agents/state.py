@@ -15,6 +15,7 @@ class AgencyState(TypedDict):
 
     # Track the active session to tie node-level logs together
     session_id: str
+    project_id: str
     
     # The router flag: The Manager updates this to dictate the next step
     next_agent: str

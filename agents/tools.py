@@ -70,6 +70,11 @@ class RunFrontendTestInput(BaseModel):
     url_path: str = Field(description="The relative URL path to test (e.g., '/' or '/snake').")
     wait_for_selector: str = Field(description="Optional CSS selector to wait for before inspecting the console.", default="")
 
+class UpdateTechnicalPlanInput(BaseModel):
+    section: str = Field(description="Must be 'system_architecture', 'active_ticket', 'changelog', or 'explored_approaches'.")
+    action: str = Field(description="Must be 'append' or 'overwrite'.")
+    content: str = Field(description="The text to add or replace.")
+
 @tool(args_schema=RunUnitTestsInput)
 def run_unit_tests(thought: str, test_command: str, config: RunnableConfig) -> str:
     """Runs isolated unit tests without booting a dev server."""
@@ -1074,3 +1079,26 @@ def generate_repo_map(thought: str, target_dir: str, config: RunnableConfig) -> 
         return output if output else "Repository map generated, but it was empty."
     except Exception as e:
         return f"Failed to generate repository map: {str(e)}"
+
+@tool(args_schema=UpdateTechnicalPlanInput)
+def update_technical_plan(section: str, action: str, content: str, config: RunnableConfig) -> str:
+    """Updates the native Technical Plan in the database."""
+    project_id = config.get("configurable", {}).get("project_id")
+    agent_role = config.get("configurable", {}).get("agent_role", "UNKNOWN")
+    
+    if not project_id:
+        return "Error: Missing project_id in system configuration."
+
+    # --- RBAC GUARDRAIL ---
+    if agent_role == "Developer":
+        if section in ["system_architecture", "ticket_type"]:
+            return f"PERMISSION DENIED: As the Developer, you cannot modify '{section}'. Only the Manager handles global architecture and classification."
+        if section in ["changelog", "explored_approaches"] and action != "append":
+            return f"PERMISSION DENIED: As the Developer, you may only 'append' to the '{section}'. You cannot 'overwrite' the historical logs."
+    # ----------------------
+
+    try:
+        update_technical_plan_db(project_id, section, action, content)
+        return f"Successfully updated the {section} section."
+    except Exception as e:
+        return f"Database error: {str(e)}"

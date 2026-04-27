@@ -3,6 +3,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
+from langchain_core.messages import BaseMessage, message_to_dict
 
 AGENCY_DB_PATH = "agency_logs.db"
 PIPELINE_DB_PATH = "pipeline.db"
@@ -51,8 +52,19 @@ def init_db():
                 node_name TEXT,   -- 'Developer', 'Manager', etc.
                 content TEXT,     -- The actual message or tool output
                 tool_name TEXT,   -- Name of the tool (if applicable)
-                is_error BOOLEAN  -- 1 if it failed, 0 if it succeeded
+                is_error BOOLEAN,  -- 1 if it failed, 0 if it succeeded
                 input_tokens INTEGER DEFAULT 0
+            )
+        ''')
+
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS technical_plans (
+                project_id TEXT PRIMARY KEY,
+                ticket_type TEXT DEFAULT 'FEATURE', -- Can be 'FEATURE' or 'BUG'
+                system_architecture TEXT DEFAULT 'No architecture defined yet.',
+                active_ticket TEXT DEFAULT 'No active tasks.',
+                changelog TEXT DEFAULT '[]', -- Stored as JSON string for easy RAG integration later
+                explored_approaches TEXT DEFAULT '[]' -- Stored as JSON string
             )
         ''')
 
@@ -76,6 +88,13 @@ def init_db():
 def log_activity(ticket_id: str, role: str, content: Any, node_name: str = None, tool_name: str = None, is_error: bool = False, session_id: str = None, project_id: str = None, input_tokens: int = 0):
     """Saves a single event to the database with serialization."""
     try:
+        # Convert LangChain objects into pure Python dictionaries BEFORE json.dumps gets them.
+        if isinstance(content, BaseMessage):
+            content = message_to_dict(content)
+        elif isinstance(content, list):
+            # If it's a list (like full_prompt), convert any BaseMessages inside it
+            content = [message_to_dict(m) if isinstance(m, BaseMessage) else m for m in content]
+
         # Serialization
         content_str = ""
         if isinstance(content, (dict, list)):
@@ -250,3 +269,82 @@ def get_completed_tasks(project_id: str):
             (project_id,)
         )
         return [dict(row) for row in cursor.fetchall()]
+
+def get_formatted_technical_plan(project_id: str, agent_role: str) -> str:
+    """Fetches the plan and formats it dynamically based on Role and Ticket Type."""
+    with get_db_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT ticket_type, system_architecture, active_ticket, changelog, explored_approaches FROM technical_plans WHERE project_id = ?", (project_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            # Initialize if it doesn't exist
+            conn.execute("INSERT INTO technical_plans (project_id) VALUES (?)", (project_id,))
+            row = ("FEATURE", "No architecture defined yet.", "No active tasks.", "[]", "[]")
+
+        ticket_type, architecture, active_ticket, changelog_json, explored_json = row
+        
+        # Parse JSON arrays (with fallbacks)
+        try:
+            changelog = json.loads(changelog_json)
+            explored = json.loads(explored_json)
+        except:
+            changelog, explored = [], []
+
+        # --- DUAL-TRACK INJECTION ---
+        if agent_role == "Developer":
+            # Developer ONLY sees the active task checklist to save tokens
+            return f"=== ACTIVE TICKET (YOUR TASK LIST) ===\n{active_ticket}\n======================================\n"
+            
+        else:
+            # Manager logic: Split context based on Feature vs Bug
+            if ticket_type == "FEATURE":
+                changelog_str = "\n".join([f"- {item}" for item in changelog]) or "No history yet."
+                return f"""
+    === TECHNICAL PLAN (FEATURE MODE) ===
+    # 1. SYSTEM ARCHITECTURE
+    {architecture}
+
+    # 2. ACTIVE TICKET
+    {active_ticket}
+
+    # 3. HISTORICAL CHANGELOG
+    {changelog_str}
+    =====================================
+    """
+            else: # BUG mode
+                # Filter `explored` array to only include the top 3 most recent/relevant results
+                explored_str = "\n".join([f"- {item}" for item in explored[-3:]]) or "No previous failures logged."
+                return f"""
+    === TECHNICAL PLAN (DEBUG MODE) ===
+    # 1. SYSTEM ARCHITECTURE
+    {architecture}
+
+    # 2. ACTIVE TICKET
+    {active_ticket}
+
+    # 3. EXPLORED APPROACHES & FAILURES (Relevant History)
+    {explored_str}
+    ===================================
+    """
+
+def update_technical_plan_db(project_id: str, section: str, action: str, content: str):
+    """Updates the specific section of the Technical Plan."""
+    valid_sections = ["system_architecture", "active_ticket", "changelog", "explored_approaches", "ticket_type"]
+    if section not in valid_sections:
+        return "Error: Invalid section."
+
+    with get_db_conn() as conn:
+        if action == "append" and section in ["changelog", "explored_approaches"]:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT {section} FROM technical_plans WHERE project_id = ?", (project_id,))
+            current_data = cursor.fetchone()[0]
+            try:
+                data_arr = json.loads(current_data)
+            except:
+                data_arr = []
+            
+            data_arr.append(content)
+            conn.execute(f"UPDATE technical_plans SET {section} = ? WHERE project_id = ?", (json.dumps(data_arr), project_id))
+        else:
+            conn.execute(f"UPDATE technical_plans SET {section} = ? WHERE project_id = ?", (content, project_id))

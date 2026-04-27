@@ -116,7 +116,8 @@ def process_ticket(task_id: str, ticket_id: str, current_session_id: str, projec
             "sandbox": workspace, # Pass the sandbox here, NOT in the state
             "tenant_config": tenant_config,
             "repo_root": repo_root,
-            "export_prefix": export_prefix
+            "export_prefix": export_prefix,
+            "project_id": project_id
         }
     }
 

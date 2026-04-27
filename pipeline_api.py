@@ -73,7 +73,8 @@ def api_resolve_build(project_id: str, task_id: str, payload: ResolveBuildPayloa
             f"SYSTEM ALERT: The CI/CD pipeline failed with the following log:\n"
             f"```log\n{error_log}\n```\n\n"
             f"HUMAN FEEDBACK: '{payload.human_feedback}'\n\n"
-            f"Please use `write_file` to fix this issue and push the code again."
+            f"Please analyze the logs to identify ALL root causes (code, infrastructure, routing, or missing dependencies). "
+            f"Address the underlying issues and push the code again."
         )
     else:
         raise HTTPException(status_code=400, detail="Invalid resolution type.")
@@ -153,12 +154,12 @@ async def api_sync_github_status(project_id: str, task_id: str):
             if jobs_url:
                 try:
                     async with httpx.AsyncClient(follow_redirects=True) as client:
-                        # 1. Get all jobs in this run
+                        # Get all jobs in this run
                         jobs_res = await client.get(jobs_url, headers=headers)
                         if jobs_res.status_code == 200:
                             jobs_data = jobs_res.json()
                             
-                            # 2. Find the specific job that failed
+                            # Find the specific job that failed
                             for job in jobs_data.get("jobs", []):
                                 if job.get("conclusion") == "failure":
                                     job_id = job["id"]
@@ -170,17 +171,44 @@ async def api_sync_github_status(project_id: str, task_id: str):
                                     if anno_res.status_code == 200:
                                         for ann in anno_res.json():
                                             if ann.get("annotation_level") == "failure":
-                                                ui_errors += f"File: {ann.get('path')} Line: {ann.get('start_line')}\nError: {ann.get('message')}\n\n"
-                                    
+                                                ui_errors += f"File: {ann.get('path', 'Unknown')} Line: {ann.get('start_line', 'Unknown')}\nError: {ann.get('message', '')}\n\n"
+
                                     # FETCH RAW TERMINAL LOGS (AS FALLBACK)
                                     log_url = f"https://api.github.com/repos/{github_repo}/actions/jobs/{job_id}/logs"
                                     log_res = await client.get(log_url, headers=headers)
-                                    
+
                                     tail_log = "No logs available."
                                     if log_res.status_code == 200:
-                                        raw_log = log_res.text
-                                        # Grab the last 2500 characters so we don't blow up the AI's context limit
-                                        tail_log = raw_log[-2500:] if len(raw_log) > 2500 else raw_log
+                                        raw_lines = log_res.text.splitlines()
+                                        error_chunks = []
+                                        
+                                        # 1. Intelligently scan for GitHub's native error tags
+                                        for i, line in enumerate(raw_lines):
+                                            if '##[error]' in line or 'Error: Process completed with exit code' in line:
+                                                # Grab the 15 lines before the error marker to capture the actual tool crash
+                                                start_idx = max(0, i - 15)
+                                                end_idx = min(len(raw_lines), i + 2) # Grab the error line itself + 1 extra
+                                                
+                                                clean_chunk = []
+                                                for j in range(start_idx, end_idx):
+                                                    # Strip the verbose ISO 8601 timestamps (e.g., '2026-04-25T10:18:42.404Z ') for a cleaner AI prompt
+                                                    parts = raw_lines[j].split("Z ", 1)
+                                                    clean_line = parts[1] if len(parts) > 1 else raw_lines[j]
+                                                    clean_chunk.append(clean_line)
+                                                    
+                                                error_chunks.append("\n".join(clean_chunk))
+                                                
+                                        if error_chunks:
+                                            # Combine all found error contexts
+                                            combined_errors = "\n\n... [next error] ...\n\n".join(error_chunks)
+                                            tail_log = combined_errors[-2500:] if len(combined_errors) > 2500 else combined_errors
+                                        else:
+                                            # 2. Absolute fallback if no error tags exist (Strip teardown, take tail)
+                                            raw_log = log_res.text
+                                            for marker in ["Cleaning up orphan processes", "Post job cleanup", "##[group]Complete job"]:
+                                                if marker in raw_log:
+                                                    raw_log = raw_log.split(marker)[0]
+                                            tail_log = raw_log[-2500:] if len(raw_log) > 2500 else raw_log
                                         
                                     # COMBINE THEM FOR THE AI
                                     error_msg = "GitHub Action Failed.\n\n"

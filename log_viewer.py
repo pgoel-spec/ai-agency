@@ -497,29 +497,41 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                     btn.innerText = sidebar.classList.contains('collapsed') ? '▶' : '◀';
                 }}
 
-                async function copyText(btn, index, stripThoughts = false) {{
+                // SHARED HELPER: Strips signatures using JSON parsing
+                function stripThoughts(rawText) {{
+                    try {{
+                        // Because the backend now stores pure JSON, this works perfectly!
+                        let parsed = JSON.parse(rawText);
+                        
+                        function walk(obj) {{
+                            if (typeof obj !== 'object' || obj === null) return;
+                            if (Array.isArray(obj)) {{
+                                obj.forEach(walk);
+                            }} else {{
+                                // Safely delete the unreadable Google/LangChain signature keys
+                                delete obj['__gemini_function_call_thought_signatures__'];
+                                delete obj['signature'];
+                                Object.values(obj).forEach(walk);
+                            }}
+                        }}
+                        
+                        walk(parsed);
+                        return JSON.stringify(parsed, null, 2);
+                        
+                    }} catch (e) {{
+                        // Fallback: If it's just a raw text string (like a terminal log) return it as-is.
+                        // Note: Legacy corrupted logs from before this fix will fall here and won't be stripped, 
+                        // but all NEW logs generated moving forward will be parsed and cleaned flawlessly.
+                        return String(rawText);
+                    }}
+                }}
+
+                // Copy Single Turn (using shared helper)
+                async function copyText(btn, index, shouldStrip = false) {{
                     try {{
                         let rawText = rawLogData[index].content;
-                        
-                        if (stripThoughts) {{
-                            try {{
-                                let parsedData = JSON.parse(rawText);
-                                function removeThoughts(obj) {{
-                                    if (typeof obj !== 'object' || obj === null) return;
-                                    if (Array.isArray(obj)) {{
-                                        obj.forEach(removeThoughts);
-                                    }} else {{
-                                        if ('__gemini_function_call_thought_signatures__' in obj) {{
-                                            delete obj['__gemini_function_call_thought_signatures__'];
-                                        }}
-                                        Object.values(obj).forEach(removeThoughts);
-                                    }}
-                                }}
-                                removeThoughts(parsedData);
-                                rawText = JSON.stringify(parsedData, null, 2);
-                            }} catch (e) {{
-                                rawText = rawText.replace(/"__gemini_function_call_thought_signatures__"\\s*:\\s*\\[[\\s\\S]*?\\](,\\s*|\\s*(?=\\}}))/g, '');
-                            }}
+                        if (shouldStrip) {{
+                            rawText = stripThoughts(rawText);
                         }}
 
                         await navigator.clipboard.writeText(rawText);
@@ -534,6 +546,47 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                         }}, 2000);
                     }} catch (err) {{
                         console.error('Failed to copy text: ', err);
+                        btn.innerHTML = "Failed";
+                    }}
+                }}
+
+                // Copy to End (Processing each message individually)
+                async function copyToEnd(btn, startIndex) {{
+                    try {{
+                        let trailText = "";
+                        
+                        for (let i = startIndex; i < rawLogData.length; i++) {{
+                            // Respect UI filters
+                            const card = document.getElementById(`card-${{i}}`);
+                            if (card && card.offsetParent === null) {{
+                                continue; 
+                            }}
+
+                            let log = rawLogData[i];
+                            // Process signature stripping and unescaping ON EACH MESSAGE
+                            let cleanText = stripThoughts(log.content);
+                            
+                            let header = `\\n\\n========== [Step ${{i + 1}}] ${{log.role.toUpperCase()}} | ${{log.node_name || 'System'}} ==========\\n\\n`;
+                            trailText += header + cleanText;
+                        }}
+
+                        if (!trailText.trim()) {{
+                            alert("No visible logs to copy.");
+                            return;
+                        }}
+
+                        await navigator.clipboard.writeText(trailText.trim());
+                        
+                        const originalText = btn.innerHTML;
+                        btn.innerHTML = "✓ Copied to End";
+                        btn.style.color = "#4ade80";
+                        
+                        setTimeout(() => {{
+                            btn.innerHTML = originalText;
+                            btn.style.color = "";
+                        }}, 2000);
+                    }} catch (err) {{
+                        console.error('Failed to copy to end: ', err);
                         btn.innerHTML = "Failed";
                     }}
                 }}
@@ -697,6 +750,7 @@ def get_log_viewer_html(page_title: str, api_endpoint: str):
                                                 <div class="dropdown-content">
                                                     <button onclick="copyText(document.getElementById('copy-btn-${{i}}'), ${{i}}, false)">Copy All</button>
                                                     <button onclick="copyText(document.getElementById('copy-btn-${{i}}'), ${{i}}, true)">Copy w/o Thoughts</button>
+                                                    <button onclick="copyToEnd(document.getElementById('copy-btn-${{i}}'), ${{i}})">Copy to End (w/o Thoughts)</button>
                                                 </div>
                                             </div>
                                             <button class="toggle-btn" id="btn-${{i}}" onclick="toggleSingleCard(this, ${{i}})"><span style="font-family: monospace; font-size: 1.1em; font-weight: bold; pointer-events: none;">▼</span> Expand</button>

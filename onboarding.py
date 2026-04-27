@@ -1126,8 +1126,11 @@ def project_workspace(project_id: str = Path(...)):
                                 errorLog = errorLog.replace(/</g, "&lt;").replace(/>/g, "&gt;"); // Safely escape HTML
                                 
                                 errorBlock = '<div class="mt-4 pt-4 border-t border-red-100 dark:border-red-900/30">' +
-                                    '<p class="text-xs font-bold text-red-600 dark:text-red-400 mb-2">Build Failed:</p>' +
-                                    '<div class="bg-gray-900 text-gray-300 p-3 rounded text-xs font-mono overflow-x-auto mb-3 max-h-32 overflow-y-auto whitespace-pre-wrap">' + errorLog + '</div>' +
+                                    '<div class="flex justify-between items-center mb-2">' +
+                                        '<p class="text-xs font-bold text-red-600 dark:text-red-400">Build Failed:</p>' +
+                                        '<button onclick="copyBuildLog(event, \\'' + tId + '\\')" class="text-xs bg-gray-100 hover:bg-gray-200 dark:bg-[#333333] dark:hover:bg-[#444444] text-gray-700 dark:text-gray-300 font-bold py-1 px-2 rounded transition border border-gray-300 dark:border-log-border flex items-center"><svg class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg><span class="btn-text">Copy</span></button>' +
+                                    '</div>' +
+                                    '<div id="err-log-' + tId + '" class="bg-gray-900 text-gray-300 p-3 rounded text-xs font-mono overflow-x-auto mb-3 max-h-32 overflow-y-auto whitespace-pre-wrap">' + errorLog + '</div>' +
                                     '<div class="flex flex-col gap-2">' +
                                         '<div class="flex items-center gap-2">' +
                                             '<input type="text" id="feedback-' + tId + '" placeholder="Optional: Tell AI how to fix this..." class="flex-1 text-xs bg-gray-50 dark:bg-[#1e1e1e] border border-gray-300 dark:border-log-border rounded px-2 py-1.5 focus:outline-none focus:border-blue-500 text-gray-800 dark:text-gray-200">' +
@@ -1298,6 +1301,22 @@ def project_workspace(project_id: str = Path(...)):
                         btn.disabled = false;
                         btn.classList.remove("opacity-50");
                     }}
+                }}
+
+                async function copyBuildLog(event, tId) {{
+                    const btn = event.currentTarget;
+                    const logText = document.getElementById('err-log-' + tId).innerText;
+                    try {{
+                        await navigator.clipboard.writeText(logText);
+                        const span = btn.querySelector('.btn-text');
+                        const origText = span.innerText;
+                        span.innerText = "Copied!";
+                        btn.classList.add("text-green-600", "dark:text-green-400");
+                        setTimeout(() => {{
+                            span.innerText = origText;
+                            btn.classList.remove("text-green-600", "dark:text-green-400");
+                        }}, 2000);
+                    }} catch(e) {{ alert("Failed to copy."); }}
                 }}
 
                 // Start polling
