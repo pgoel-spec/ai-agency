@@ -8,7 +8,7 @@ from datetime import datetime
 from fastapi import APIRouter, Request, Form, Path
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
-from database import get_sessions_by_project
+from database import get_sessions_by_project, get_db_conn
 
 router = APIRouter()
 
@@ -78,8 +78,9 @@ async def inject_github_workflow(project_id: str, github_repo: str, github_token
         return False
         
     saas_url = linear_uri.replace("/auth/linear/callback", "/webhooks/preview-ready")
+    pr_closed_url = linear_uri.replace("/auth/linear/callback", f"/webhooks/github-pr-closed?project_id={project_id}")
 
-    workflow_yaml = f"""name: Notify AI Agency of Preview
+    preview_yaml = f"""name: Notify AI Agency of Preview
 on: pull_request
 jobs:
   notify:
@@ -93,17 +94,49 @@ jobs:
           -d '{{"tenant_id": "{project_id}", "ticket_id": "${{{{ github.head_ref }}}}", "preview_url": "Ready to review!"}}' \\
           {saas_url}
 """
-    encoded_content = base64.b64encode(workflow_yaml.encode("utf-8")).decode("utf-8")
-    url = f"https://api.github.com/repos/{github_repo}/contents/.github/workflows/ai-agency-webhook.yml"
+
+    closure_yaml = f"""name: Notify AI Agency of PR Closure
+on:
+  pull_request:
+    types: [closed]
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send PR Closure Webhook
+        run: |
+          curl -X POST -H "Content-Type: application/json" \\
+          -d "{{\\"action\\": \\"closed\\", \\"pull_request\\": {{\\"merged\\": ${{{{ github.event.pull_request.merged }}}}, \\"title\\": \\"${{{{ github.event.pull_request.title }}}}\\", \\"body\\": \\"Skipped for brevity\\"}}}}" \\
+          {pr_closed_url}
+"""
+
     headers = {"Authorization": f"Bearer {github_token}", "Accept": "application/vnd.github.v3+json"}
-    payload = {"message": "🤖 AI Agency: Initializing CI/CD Webhooks", "content": encoded_content, "branch": "main"}
 
     async with httpx.AsyncClient() as client:
-        get_resp = await client.get(url, headers=headers)
-        if get_resp.status_code == 200:
-            payload["sha"] = get_resp.json().get("sha")
-        response = await client.put(url, headers=headers, json=payload)
-    return response.status_code in (200, 201)
+        # 1. Inject the original Preview Webhook
+        encoded_preview = base64.b64encode(preview_yaml.encode("utf-8")).decode("utf-8")
+        preview_api_url = f"https://api.github.com/repos/{github_repo}/contents/.github/workflows/ai-agency-webhook.yml"
+        preview_payload = {"message": "🤖 AI Agency: Initializing CI/CD Webhooks", "content": encoded_preview, "branch": "main"}
+
+        get_preview_resp = await client.get(preview_api_url, headers=headers)
+        if get_preview_resp.status_code == 200:
+            preview_payload["sha"] = get_preview_resp.json().get("sha")
+            
+        put_preview_resp = await client.put(preview_api_url, headers=headers, json=preview_payload)
+        
+        # 2. Inject the new PR Closure Webhook
+        encoded_closure = base64.b64encode(closure_yaml.encode("utf-8")).decode("utf-8")
+        closure_api_url = f"https://api.github.com/repos/{github_repo}/contents/.github/workflows/ai-agency-pr-closure.yml"
+        closure_payload = {"message": "🤖 AI Agency: Initializing PR Sync Webhook", "content": encoded_closure, "branch": "main"}
+        
+        get_closure_resp = await client.get(closure_api_url, headers=headers)
+        if get_closure_resp.status_code == 200:
+            closure_payload["sha"] = get_closure_resp.json().get("sha")
+            
+        put_closure_resp = await client.put(closure_api_url, headers=headers, json=closure_payload)
+        
+    # Return True only if BOTH workflow injections succeeded
+    return put_preview_resp.status_code in (200, 201) and put_closure_resp.status_code in (200, 201)
 
 # ==========================================
 # 3. API ENDPOINTS
@@ -280,10 +313,10 @@ def get_sidebar_html(active_page="dashboard"):
     """
 
 def get_project_sidebar_html(project_id, project_name, active_page="pipeline"):
-    """Project-specific sidebar. Note we now pass project_id to build the links."""
+    """Project-specific sidebar. Includes the new Technical Plan tab."""
     pipe_active = "bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 font-medium" if active_page == "pipeline" else "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-[#333333]"
+    plan_active = "bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 font-medium" if active_page == "plan" else "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-[#333333]"
     
-    # The logs link is no longer a JS tab, it navigates to the global logs page with a filter
     return f"""
     <div class="w-64 bg-white dark:bg-log-surface border-r border-gray-200 dark:border-log-border flex flex-col flex-shrink-0">
         <div class="p-4 border-b border-gray-200 dark:border-log-border">
@@ -298,8 +331,12 @@ def get_project_sidebar_html(project_id, project_name, active_page="pipeline"):
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
                 <span>Ticket Pipeline</span>
             </a>
-            <a href="/logs?project={project_id}" class="flex items-center space-x-3 px-4 py-3 rounded transition text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-[#333333]">
+            <a href="/project/{project_id}/plan" class="flex items-center space-x-3 px-4 py-3 rounded transition {plan_active}">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                <span>Technical Plan</span>
+            </a>
+            <a href="/logs?project={project_id}" class="flex items-center space-x-3 px-4 py-3 rounded transition text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-[#333333]">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                 <span>Run History</span>
             </a>
         </nav>
@@ -376,50 +413,182 @@ def get_modal_html():
     # Dynamically grab the base domain from the environment
     base_uri = os.getenv("LINEAR_REDIRECT_URI", "")
     if not base_uri:
-        # A clear, human-readable placeholder if the env var is missing
         webhook_target = "https://<YOUR_DOMAIN_OR_NGROK>/webhooks/pr-build-failed"
     else:
-        # Strip the linear path to get the base domain, then append the webhook route
         webhook_target = base_uri.replace("/auth/linear/callback", "/webhooks/pr-build-failed")
 
     return f"""
-    <div id="onboard-modal" class="fixed inset-0 bg-gray-900 bg-opacity-60 overflow-y-auto h-full w-full hidden z-50 flex items-center justify-center">
-        <div class="bg-white dark:bg-log-surface p-8 rounded-xl shadow-2xl max-w-md w-full relative h-[650px] flex flex-col transition-colors border border-transparent dark:border-log-border">
-            <button onclick="closeModal()" class="absolute top-4 right-4 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">
+    <div id="panel-overlay" onclick="closeModal()" class="fixed inset-0 bg-gray-900 bg-opacity-60 backdrop-blur-sm hidden z-40 transition-opacity"></div>
+
+    <div id="onboard-panel" class="fixed inset-y-0 right-0 z-50 w-full max-w-xl bg-white dark:bg-log-surface shadow-2xl transform translate-x-full transition-transform duration-300 ease-in-out flex flex-col border-l border-gray-200 dark:border-log-border">
+        
+        <div class="px-8 py-5 border-b border-gray-200 dark:border-log-border flex justify-between items-center bg-gray-50 dark:bg-[#1e1e1e] flex-shrink-0">
+            <div>
+                <h2 id="modal-title" class="text-2xl font-bold text-gray-800 dark:text-log-text">New Project</h2>
+                <p id="modal-subtitle" class="text-sm text-gray-600 dark:text-gray-400 mt-1">Configure your AI Developer workspace.</p>
+            </div>
+            <button onclick="closeModal()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition p-2 rounded-full hover:bg-gray-200 dark:hover:bg-[#333333]">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
             </button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto">
             
-            <h2 id="modal-title" class="text-2xl font-bold text-gray-800 dark:text-log-text mb-1">New Project</h2>
-            <p id="modal-subtitle" class="text-sm text-gray-600 dark:text-gray-400 mb-4">Connect a repository for your AI Developer.</p>
-            
-            <div class="flex border-b border-gray-200 dark:border-log-border mb-6 flex-shrink-0">
-                <button type="button" id="tab-1" onclick="switchTab(1)" class="w-1/3 py-3 text-sm text-center font-bold border-b-2 border-blue-600 text-blue-600 dark:text-blue-400 transition">1. GitHub</button>
-                <button type="button" id="tab-2" onclick="switchTab(2)" class="w-1/3 py-3 text-sm text-center font-bold border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">2. Issue Tracking</button>
-                <button type="button" id="tab-3" onclick="switchTab(3)" class="w-1/3 py-3 text-sm text-center font-bold border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">3. CI/CD Setup</button>
+            <div id="connection-health" class="px-8 py-4 bg-gray-100 dark:bg-[#1a1a1a] border-b border-gray-200 dark:border-log-border hidden">
+                <h3 class="text-sm font-bold text-gray-800 dark:text-log-text mb-3 uppercase tracking-wider">Connection Health</h3>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="flex items-center text-sm text-gray-700 dark:text-gray-300">
+                        <span id="health-repo" class="w-3 h-3 rounded-full bg-gray-400 mr-2 shadow-sm"></span> Repository Access
+                    </div>
+                    <div class="flex items-center text-sm text-gray-700 dark:text-gray-300">
+                        <span id="health-webhooks" class="w-3 h-3 rounded-full bg-gray-400 mr-2 shadow-sm"></span> GitHub Webhooks
+                    </div>
+                    <div class="flex items-center text-sm text-gray-700 dark:text-gray-300">
+                        <span id="health-linear" class="w-3 h-3 rounded-full bg-gray-400 mr-2 shadow-sm"></span> Issue Tracker
+                    </div>
+                </div>
             </div>
 
-            <div id="step-3" class="hidden flex-1 flex-col overflow-y-auto pb-4">
-                <div class="mb-4">
-                    <p class="text-sm text-gray-600 dark:text-gray-400">To allow the AI to automatically fix build errors, add this integration to your GitHub Actions.</p>
-                </div>
-                <div class="space-y-4">
-                    <div>
-                        <h4 class="text-sm font-bold text-gray-800 dark:text-gray-200 mb-1">Step A: Add GitHub Secret</h4>
-                        <p class="text-xs text-gray-500 mb-2">Go to your Repository -> Settings -> Secrets and Variables -> Actions. Create a new secret named <code>AGENCY_WEBHOOK_SECRET</code> with this value:</p>
-                        <div class="bg-gray-100 dark:bg-[#1e1e1e] p-2 rounded border border-gray-300 dark:border-log-border flex justify-between items-center">
-                            <code id="snippet-webhook-secret" class="text-xs text-blue-600 dark:text-blue-400 break-all font-mono">Save project first...</code>
+            <div class="py-2 bg-white dark:bg-log-surface">
+                
+                <div>
+                    <button type="button" onclick="toggleAccordion('step-1')" class="w-full flex justify-between items-center group focus:outline-none px-8 py-4">
+                        <div class="text-left pr-4">
+                            <h3 class="text-base font-bold text-gray-800 dark:text-gray-200 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">Step 1: GitHub Configuration</h3>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 font-normal">The AI needs read/write access to your repository to analyze code, write features, and automatically create Pull Requests.</p>
+                        </div>
+                        <svg id="icon-step-1" class="w-5 h-5 text-gray-400 group-hover:text-blue-500 transform transition-transform duration-300 rotate-180 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                    </button>
+                    
+                    <div id="content-step-1" class="overflow-hidden transition-all duration-500 ease-in-out max-h-[1500px] opacity-100">
+                        <div class="px-8 pb-8 pt-2">
+                            <form id="step-1" class="space-y-6">
+                                
+                                <input type="hidden" id="project-id" value="">
+                                
+                                <div>
+                                    <label class="block text-sm font-bold text-gray-700 dark:text-gray-300">Project Name</label>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 mb-2">A friendly name for your dashboard.</p>
+                                    <input type="text" id="project-name" required class="block w-full rounded-md border border-gray-300 dark:border-log-border shadow-sm p-2.5 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-[#1e1e1e] dark:text-log-text" placeholder="e.g. Acme Corp Web App">
+                                </div>
+                                
+                                <div>
+                                    <label class="block text-sm font-bold text-gray-700 dark:text-gray-300 flex items-center">
+                                        GitHub Repository
+                                        <div class="relative ml-2 flex items-center">
+                                            <svg class="w-4 h-4 text-gray-400 cursor-help tooltip-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                            <div class="tooltip-text hidden absolute z-10 w-64 p-2 mt-1 text-xs text-white bg-gray-800 rounded-lg shadow-lg left-6 top-0">Exact URL slug. Token must have access to this.</div>
+                                        </div>
+                                    </label>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 mb-2">Copy the exact path from your GitHub URL (Format: <strong>Organization/Repository</strong>).</p>
+                                    <input type="text" id="github-repo" required class="block w-full rounded-md border border-gray-300 dark:border-log-border shadow-sm p-2.5 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-[#1e1e1e] dark:text-log-text" placeholder="e.g. facebook/react">
+                                </div>
+                                
+                                <div>
+                                    <label class="block text-sm font-bold text-gray-700 dark:text-gray-300">GitHub Fine-Grained Token</label>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 mb-2 leading-relaxed">
+                                        Go to GitHub Settings &gt; Developer Settings &gt; Personal Access Tokens &gt; Fine-grained tokens. <br>
+                                        Requires <strong>Read & Write</strong> access for: <strong>Contents</strong>, <strong>Workflows</strong>, and <strong>Pull Requests</strong>.
+                                    </p>
+                                    <div class="relative">
+                                        <input type="password" id="github-token" required class="block w-full rounded-md border border-gray-300 dark:border-log-border shadow-sm p-2.5 pr-10 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-[#1e1e1e] dark:text-log-text" placeholder="github_pat_...">
+                                        <button type="button" onclick="togglePasswordVisibility('github-token', 'eye-icon-token')" class="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">
+                                            <svg id="eye-icon-token" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.543 7-1.275 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </div>
+                                
+                                <div class="flex justify-end pt-2">
+                                    <button type="button" id="btn-test-connection" onclick="submitOnboardForm(true)" class="text-sm bg-gray-900 hover:bg-black dark:bg-gray-200 dark:hover:bg-white dark:text-black text-white font-bold py-2.5 px-5 rounded-lg transition shadow-sm">
+                                        Test Connection & Inject Webhooks
+                                    </button>
+                                </div>
+                            </form>
                         </div>
                     </div>
-                    <div>
-                        <div class="flex justify-between items-center mb-1">
-                            <h4 class="text-sm font-bold text-gray-800 dark:text-gray-200">Step B: Update Workflow YAML</h4>
-                            <button type="button" onclick="copyYamlSnippet(this)" class="text-xs bg-gray-200 hover:bg-gray-300 dark:bg-[#333333] dark:hover:bg-[#444444] text-gray-700 dark:text-gray-300 font-bold py-1 px-2 rounded transition border border-gray-300 dark:border-log-border flex items-center">
-                                <svg class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-                                <span class="btn-text">Copy</span>
-                            </button>
+                </div>
+
+                <div id="step-2-container" class="border-t-2 border-dotted border-gray-200 dark:border-gray-700 opacity-50 pointer-events-none transition-opacity duration-300">
+                    <button type="button" onclick="toggleAccordion('step-2')" class="w-full flex justify-between items-center group focus:outline-none px-8 py-4">
+                        <div class="text-left pr-4">
+                            <h3 class="text-base font-bold text-gray-800 dark:text-gray-200 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">Step 2: Issue Tracking</h3>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 font-normal">Select your team's project management tool so your AI can automatically read tickets, update statuses, and notify you when PRs are ready.</p>
                         </div>
-                        <p class="text-xs text-gray-500 mb-2">Paste this snippet at the very end of your deployment <code>.yml</code> file:</p>
-                        <textarea id="yaml-template" class="hidden">      - name: Report Build Failure to AI Agency
+                        <svg id="icon-step-2" class="w-5 h-5 text-gray-400 group-hover:text-blue-500 transform transition-transform duration-300 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                    </button>
+                    
+                    <div id="content-step-2" class="overflow-hidden transition-all duration-500 ease-in-out max-h-0 opacity-0">
+                        <div class="px-8 pb-8 pt-2">
+                            <p class="text-xs text-orange-500 mb-4 font-medium" id="step-2-warning">Please save Step 1 first to unlock this section.</p>
+                            
+                            <div class="space-y-3">
+                                <div class="border border-gray-200 dark:border-log-border rounded-lg p-5 flex items-center justify-between bg-white dark:bg-[#1e1e1e] shadow-sm">
+                                    <div class="flex items-center space-x-4">
+                                        <div class="w-10 h-10 bg-gray-900 dark:bg-black rounded-lg flex items-center justify-center text-white font-bold text-xl"><svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm-1.87 17.5l-2.06-2.06L13.63 9.88l2.06 2.06-5.56 5.56z"/></svg></div>
+                                        <div>
+                                            <h4 class="font-bold text-gray-800 dark:text-log-text text-sm">Linear</h4>
+                                            <p class="text-xs text-gray-500 dark:text-gray-400" id="linear-status-text">Not connected</p>
+                                        </div>
+                                    </div>
+                                    <div class="flex space-x-2">
+                                        <a id="linear-oauth-btn" href="#" target="_blank" class="text-sm bg-gray-900 hover:bg-black dark:bg-gray-200 dark:hover:bg-white dark:text-black text-white font-bold py-2 px-4 rounded-lg transition shadow-sm">Connect</a>
+                                        <button id="linear-verify-btn" type="button" onclick="verifyLinearWebhook()" class="hidden text-sm bg-gray-100 hover:bg-gray-200 dark:bg-[#333333] dark:hover:bg-[#444444] text-gray-700 dark:text-gray-300 font-bold py-2 px-4 rounded-lg border border-gray-300 dark:border-log-border transition shadow-sm">Verify</button>
+                                        <button id="linear-disconnect-btn" type="button" onclick="disconnectLinear()" class="hidden text-sm bg-red-50 hover:bg-red-100 text-red-600 font-bold py-2 px-4 rounded-lg border border-red-200 transition shadow-sm">Disconnect</button>
+                                    </div>
+                                </div>
+                                <div class="border border-gray-100 dark:border-log-border rounded-lg p-5 flex items-center justify-between opacity-60 bg-gray-50 dark:bg-[#1e1e1e]">
+                                    <div class="flex items-center space-x-4">
+                                        <div class="w-10 h-10 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-xl shadow-sm">
+                                            <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M11.53 2c.48 0 .96.18 1.33.55l8.59 8.59c.73.73.73 1.92 0 2.66l-8.59 8.59c-.37.37-.85.55-1.33.55s-.96-.18-1.33-.55l-8.59-8.59c-.73-.73-.73-1.92 0-2.66l8.59-8.59c.37-.37.85-.55 1.33-.55zm-4.3 11.41l2.97-2.97-2.97-2.97-2.97 2.97 2.97 2.97zm8.59 0l2.97-2.97-2.97-2.97-2.97 2.97 2.97 2.97zm-4.29 4.3l2.97-2.97-2.97-2.97-2.97 2.97 2.97 2.97z"/></svg>
+                                        </div>
+                                        <div>
+                                            <h4 class="font-bold text-gray-800 dark:text-log-text text-sm">Jira Software</h4>
+                                            <p class="text-xs text-gray-500 dark:text-gray-400">Coming soon</p>
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <button type="button" disabled class="text-sm bg-gray-200 dark:bg-[#333333] text-gray-400 dark:text-gray-500 font-bold py-2 px-4 rounded-lg cursor-not-allowed">Connect</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="border-t-2 border-dotted border-gray-200 dark:border-gray-700">
+                    <button type="button" onclick="toggleAccordion('step-3')" class="w-full flex justify-between items-center group focus:outline-none px-8 py-4">
+                        <div class="text-left pr-4">
+                            <h3 class="text-base font-bold text-gray-800 dark:text-gray-200 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">Step 3: CI/CD Setup (Optional)</h3>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 font-normal">To allow the AI to automatically catch failed deployments and fix build errors, you need to add this manual integration to your GitHub Actions.</p>
+                        </div>
+                        <svg id="icon-step-3" class="w-5 h-5 text-gray-400 group-hover:text-blue-500 transform transition-transform duration-300 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                    </button>
+                    
+                    <div id="content-step-3" class="overflow-hidden transition-all duration-500 ease-in-out max-h-0 opacity-0">
+                        <div class="px-8 pb-8 pt-2 space-y-8">
+                            
+                            <div>
+                                <label class="block text-sm font-bold text-gray-700 dark:text-gray-300">Step A: Add GitHub Secret</label>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 mb-2">Go to your Repository &gt; Settings &gt; Secrets and Variables &gt; Actions. Create a new secret named <code class="bg-gray-100 dark:bg-[#2d2d2d] px-1 rounded text-red-500">AGENCY_WEBHOOK_SECRET</code> with this exact value:</p>
+                                <div class="relative">
+                                    <input type="password" id="snippet-webhook-secret" readonly class="block w-full rounded-md border border-gray-300 dark:border-log-border shadow-sm p-2.5 pr-10 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-[#1e1e1e] dark:text-log-text outline-none" value="Save project first to generate secret...">
+                                    <button type="button" onclick="togglePasswordVisibility('snippet-webhook-secret', 'eye-icon-secret')" class="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">
+                                        <svg id="eye-icon-secret" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.543 7-1.275 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-bold text-gray-700 dark:text-gray-300">Step B: Update Workflow YAML</label>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 mb-2">Paste this snippet at the <strong>very end</strong> of your deployment <code>.yml</code> file (e.g., your Firebase or Vercel deploy action).</p>
+                                
+                                <textarea id="yaml-template" class="hidden">      - name: Report Build Failure to AI Agency
         if: failure()
         env:
           GH_TOKEN: ${{{{ github.token }}}}
@@ -446,92 +615,31 @@ def get_modal_html():
           -H "X-Agency-Signature: ${{{{ secrets.AGENCY_WEBHOOK_SECRET }}}}" \\
           -d "{{\\"tenant_id\\": \\"__TENANT_ID__\\", \\"branch_name\\": \\"${{{{ github.head_ref || github.ref_name }}}}\\", \\"commit_sha\\": \\"${{{{ github.sha }}}}\\", \\"error_log\\": $ESCAPED_LOG}}" \\
           {webhook_target}</textarea>
-                        <pre class="bg-gray-900 text-gray-300 p-3 rounded-lg text-xs overflow-x-auto border border-gray-700 font-mono leading-relaxed"><code id="yaml-snippet-code">Save project first to generate code...</code></pre>
+                                
+                                <div class="relative mt-2 group">
+                                    <pre id="yaml-pre-container" class="block w-full rounded-md border border-gray-300 dark:border-log-border shadow-sm p-4 bg-white dark:bg-[#1e1e1e] text-gray-800 dark:text-gray-300 text-xs overflow-x-auto font-mono leading-relaxed transition-all duration-200"><code id="yaml-snippet-code">Save project first to generate code...</code></pre>
+                                    <button type="button" onclick="copyYamlSnippet(this)" class="absolute top-3 right-3 flex items-center text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition bg-white dark:bg-[#2d2d2d] rounded-md p-1.5 shadow-sm border border-gray-200 dark:border-log-border" title="Copy code">
+                                        <svg class="w-3.5 h-3.5 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                                        <span class="btn-text font-bold text-xs">Copy</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
+
             </div>
-
-            <form id="step-1" class="flex-1 flex flex-col">
-                <input type="hidden" id="project-id" value="">
-                <div class="space-y-4">
-                    <div>
-                        <label class="block text-sm font-bold text-gray-700 dark:text-gray-300">Project Name</label>
-                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 mb-1">A friendly name for your dashboard.</p>
-                        <input type="text" id="project-name" required class="block w-full rounded-md border-gray-300 dark:border-log-border shadow-sm p-2 border focus:ring-blue-500 focus:border-blue-500 bg-gray-50 dark:bg-[#1e1e1e] dark:text-log-text" placeholder="e.g. Acme Corp Web App">
-                    </div>
-                    <div>
-                        <label class="block text-sm font-bold text-gray-700 dark:text-gray-300 flex items-center">
-                            GitHub Repository
-                            <div class="relative ml-2 flex items-center">
-                                <svg class="w-4 h-4 text-gray-400 cursor-help tooltip-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                                <div class="tooltip-text hidden absolute z-10 w-64 p-2 mt-1 text-xs text-white bg-gray-800 rounded-lg shadow-lg left-6 top-0">Exact URL slug. Token must have access to this.</div>
-                            </div>
-                        </label>
-                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 mb-1">Format exactly as <strong>Organization/Repository</strong>.</p>
-                        <input type="text" id="github-repo" required class="block w-full rounded-md border-gray-300 dark:border-log-border shadow-sm p-2 border focus:ring-blue-500 focus:border-blue-500 bg-gray-50 dark:bg-[#1e1e1e] dark:text-log-text" placeholder="e.g. facebook/react">
-                    </div>
-                    <div class="bg-blue-50 dark:bg-[#1e1e1e] p-3 rounded-lg border border-blue-100 dark:border-log-border">
-                        <label class="block text-sm font-bold text-blue-900 dark:text-blue-300 mb-1">GitHub Fine-Grained Token</label>
-                        <p class="text-xs text-blue-800 dark:text-gray-400 mb-2 leading-relaxed">
-                            Requires <strong>Read & Write</strong> for: Contents, Workflows, and Pull Requests.
-                        </p>
-                        <input type="password" id="github-token" required class="block w-full rounded-md border-blue-300 dark:border-log-border shadow-sm p-2 border focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-[#1e1e1e] dark:text-log-text" placeholder="github_pat_...">
-                    </div>
-                </div>
-
-                <div class="mt-auto flex justify-end pt-4 border-t border-gray-100 dark:border-log-border">
-                    <button type="button" id="btn-test-connection" onclick="submitOnboardForm(true)" class="bg-gray-800 hover:bg-gray-900 text-white font-bold py-2 px-4 rounded transition shadow-md text-sm">
-                        Test Connection & Save
-                    </button>
-                </div>
-            </form>
-
-            <div id="step-2" class="hidden flex-1 flex-col">
-                <div class="mb-4">
-                    <p class="text-sm text-gray-600 dark:text-gray-400">Select your team's project management tool so your AI can read tickets and update PRs.</p>
-                </div>
-                <div class="space-y-3">
-                    <div class="border border-gray-200 dark:border-log-border rounded-lg p-4 flex items-center justify-between bg-white dark:bg-[#1e1e1e]">
-                        <div class="flex items-center space-x-3">
-                            <div class="w-10 h-10 bg-gray-900 dark:bg-black rounded-lg flex items-center justify-center text-white font-bold text-lg"><svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm-1.87 17.5l-2.06-2.06L13.63 9.88l2.06 2.06-5.56 5.56z"/></svg></div>
-                            <div>
-                                <h4 class="font-bold text-gray-800 dark:text-log-text text-sm">Linear</h4>
-                                <p class="text-xs text-gray-500 dark:text-gray-400" id="linear-status-text">Not connected</p>
-                            </div>
-                        </div>
-                        <div class="flex space-x-2">
-                            <a id="linear-oauth-btn" href="#" target="_blank" class="text-xs bg-gray-900 hover:bg-black text-white font-bold py-2 px-4 rounded transition">Connect</a>
-                            <button id="linear-verify-btn" type="button" onclick="verifyLinearWebhook()" class="hidden text-xs bg-gray-100 hover:bg-gray-200 dark:bg-[#333333] dark:hover:bg-[#444444] text-gray-700 dark:text-gray-300 font-bold py-2 px-3 rounded border border-gray-300 dark:border-log-border transition">Verify</button>
-                            <button id="linear-disconnect-btn" type="button" onclick="disconnectLinear()" class="hidden text-xs bg-red-50 hover:bg-red-100 text-red-600 font-bold py-2 px-3 rounded border border-red-200 transition">Disconnect</button>
-                        </div>
-                    </div>
-                    <div class="border border-gray-100 dark:border-log-border rounded-lg p-4 flex items-center justify-between opacity-60 bg-gray-50 dark:bg-[#1e1e1e]">
-                        <div class="flex items-center space-x-3">
-                            <div class="w-10 h-10 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-lg shadow-sm">
-                                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M11.53 2c.48 0 .96.18 1.33.55l8.59 8.59c.73.73.73 1.92 0 2.66l-8.59 8.59c-.37.37-.85.55-1.33.55s-.96-.18-1.33-.55l-8.59-8.59c-.73-.73-.73-1.92 0-2.66l8.59-8.59c.37-.37.85-.55 1.33-.55zm-4.3 11.41l2.97-2.97-2.97-2.97-2.97 2.97 2.97 2.97zm8.59 0l2.97-2.97-2.97-2.97-2.97 2.97 2.97 2.97zm-4.29 4.3l2.97-2.97-2.97-2.97-2.97 2.97 2.97 2.97z"/></svg>
-                            </div>
-                            <div>
-                                <h4 class="font-bold text-gray-800 dark:text-log-text text-sm">Jira Software</h4>
-                                <p class="text-xs text-gray-500 dark:text-gray-400">Coming soon</p>
-                            </div>
-                        </div>
-                        <div>
-                            <button type="button" disabled class="text-xs bg-gray-200 dark:bg-[#333333] text-gray-400 dark:text-gray-500 font-bold py-2 px-4 rounded cursor-not-allowed">Connect</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="mt-6 pt-4 border-t border-gray-200 dark:border-log-border flex justify-end space-x-3 bg-gray-50 dark:bg-[#1e1e1e] -mx-8 -mb-8 p-6 rounded-b-xl flex-shrink-0">
-                <button type="button" onclick="closeModal()" class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-[#2d2d2d] border border-gray-300 dark:border-log-border rounded-lg hover:bg-gray-50 dark:hover:bg-[#3d3d3d] transition">
-                    Cancel
-                </button>
-                <button type="button" onclick="submitOnboardForm(false)" class="px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-lg hover:bg-blue-700 transition shadow-sm">
-                    Save Project
-                </button>
-            </div>
-
         </div>
+
+        <div class="px-8 py-5 border-t border-gray-200 dark:border-log-border flex justify-end space-x-3 bg-gray-50 dark:bg-[#1e1e1e] flex-shrink-0">
+            <button type="button" onclick="closeModal()" class="px-5 py-2.5 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-[#2d2d2d] border border-gray-300 dark:border-log-border rounded-lg hover:bg-gray-50 dark:hover:bg-[#3d3d3d] transition shadow-sm">
+                Cancel
+            </button>
+            <button type="button" onclick="submitOnboardForm(false)" class="px-5 py-2.5 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-lg hover:bg-blue-700 transition shadow-sm">
+                Save Workspace Configuration
+            </button>
+        </div>
+
     </div>
     """
 
@@ -655,21 +763,54 @@ def admin_dashboard():
                         alert("Failed to copy code.");
                     }}
                 }}
-                function switchTab(step) {{
-                    const aClass = "w-1/3 py-3 text-sm text-center font-bold border-b-2 border-blue-600 text-blue-600 dark:text-blue-400 transition";
-                    const iClass = "w-1/3 py-3 text-sm text-center font-bold border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition";
-                    
-                    for (let i = 1; i <= 3; i++) {{
-                        const tab = document.getElementById('tab-' + i);
-                        const stp = document.getElementById('step-' + i);
-                        if (i === step) {{
-                            tab.className = aClass;
-                            stp.classList.remove('hidden'); stp.classList.add('flex');
-                        }} else {{
-                            tab.className = iClass;
-                            stp.classList.remove('flex'); stp.classList.add('hidden');
-                        }}
+
+                function togglePasswordVisibility(inputId, iconId) {{
+                    const input = document.getElementById(inputId);
+                    const icon = document.getElementById(iconId);
+                    if (input.type === "password") {{
+                        input.type = "text";
+                        icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"></path>';
+                    }} else {{
+                        input.type = "password";
+                        icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.543 7-1.275 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>';
                     }}
+                }}
+
+                function toggleBlur(containerId, iconId) {{
+                    const container = document.getElementById(containerId);
+                    const icon = document.getElementById(iconId);
+                    if (container.classList.contains('blur-sm')) {{
+                        container.classList.remove('blur-sm', 'select-none');
+                        icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"></path>';
+                    }} else {{
+                        container.classList.add('blur-sm', 'select-none');
+                        icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.543 7-1.275 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>';
+                    }}
+                }}
+
+                function toggleAccordion(stepId) {{
+                    const steps = ['step-1', 'step-2', 'step-3'];
+
+                    steps.forEach(id => {{
+                        const content = document.getElementById('content-' + id);
+                        const icon = document.getElementById('icon-' + id);
+
+                        if (id === stepId) {{
+                            if (content.classList.contains('max-h-0')) {{
+                                content.classList.remove('max-h-0', 'opacity-0');
+                                content.classList.add('max-h-[1500px]', 'opacity-100');
+                                icon.classList.add('rotate-180');
+                            }} else {{
+                                content.classList.remove('max-h-[1500px]', 'opacity-100');
+                                content.classList.add('max-h-0', 'opacity-0');
+                                icon.classList.remove('rotate-180');
+                            }}
+                        }} else {{
+                            content.classList.remove('max-h-[1500px]', 'opacity-100');
+                            content.classList.add('max-h-0', 'opacity-0');
+                            icon.classList.remove('rotate-180');
+                        }}
+                    }});
                 }}
 
                 function openModal(pId = '', pName = '', repo = '', token = '', ghStatus = '', hasLin = false, whSecret = '') {{
@@ -678,14 +819,42 @@ def admin_dashboard():
                     document.getElementById('github-repo').value = repo;
                     document.getElementById('github-token').value = token;
                     
+                    const panel = document.getElementById('onboard-panel');
+                    const overlay = document.getElementById('panel-overlay');
+                    const step2Container = document.getElementById('step-2-container');
+                    const warning2 = document.getElementById('step-2-warning');
+                    const healthSection = document.getElementById('connection-health');
+                    
+                    ['step-1', 'step-2', 'step-3'].forEach(id => {{
+                        const content = document.getElementById('content-' + id);
+                        const icon = document.getElementById('icon-' + id);
+                        if (id === 'step-1') {{
+                            content.classList.remove('max-h-0', 'opacity-0');
+                            content.classList.add('max-h-[1500px]', 'opacity-100');
+                            icon.classList.add('rotate-180');
+                        }} else {{
+                            content.classList.remove('max-h-[1500px]', 'opacity-100');
+                            content.classList.add('max-h-0', 'opacity-0');
+                            icon.classList.remove('rotate-180');
+                        }}
+                    }});
+                    
                     if (pId !== '') {{
                         document.getElementById('linear-oauth-btn').href = `/install/linear?project_id=${{pId}}`;
-                        document.getElementById('modal-title').innerText = "Edit Project";
+                        document.getElementById('modal-title').innerText = "Workspace Settings";
                         document.getElementById('modal-subtitle').innerText = `Update details for ${{pName}}.`;
                         
                         updateYamlSnippet(pId);
-                        document.getElementById('snippet-webhook-secret').innerText = whSecret || "Save project to generate secret...";
+                        document.getElementById('snippet-webhook-secret').value = whSecret || "Save project to generate secret...";
                         
+                        step2Container.classList.remove('opacity-50', 'pointer-events-none');
+                        warning2.classList.add('hidden');
+                        
+                        healthSection.classList.remove('hidden');
+                        document.getElementById('health-repo').className = 'w-3 h-3 rounded-full mr-2 shadow-sm ' + (ghStatus === 'success' ? 'bg-green-500' : 'bg-red-500');
+                        document.getElementById('health-webhooks').className = 'w-3 h-3 rounded-full mr-2 shadow-sm ' + (ghStatus === 'success' ? 'bg-green-500' : 'bg-yellow-500');
+                        document.getElementById('health-linear').className = 'w-3 h-3 rounded-full mr-2 shadow-sm ' + (hasLin ? 'bg-green-500' : 'bg-gray-400');
+
                         if (hasLin) {{
                             document.getElementById('linear-status-text').innerText = "Connected and active";
                             document.getElementById('linear-status-text').classList.replace("text-gray-500", "text-green-600");
@@ -700,29 +869,40 @@ def admin_dashboard():
                             document.getElementById('linear-verify-btn').classList.add('hidden');
                         }}
 
-                        if (ghStatus === 'success' && !hasLin) switchTab(2); else switchTab(1);
-
                     }} else {{
                         document.getElementById('linear-oauth-btn').href = "#"; 
                         document.getElementById('modal-title').innerText = "New Project";
-                        document.getElementById('modal-subtitle').innerText = "Connect a repository for your AI Developer.";
+                        document.getElementById('modal-subtitle').innerText = "Configure your AI Developer workspace.";
                         document.getElementById('linear-status-text').innerText = "Not connected";
                         document.getElementById('linear-status-text').classList.replace("text-green-600", "text-gray-500");
                         document.getElementById('linear-oauth-btn').classList.remove('hidden');
                         document.getElementById('linear-disconnect-btn').classList.add('hidden');
+                        document.getElementById('linear-verify-btn').classList.add('hidden');
                         
                         updateYamlSnippet("YOUR_TENANT_ID");
-                        document.getElementById('snippet-webhook-secret').innerText = "Save project first...";
+                        document.getElementById('snippet-webhook-secret').value = "Save project first...";
                         
-                        switchTab(1);
+                        step2Container.classList.add('opacity-50', 'pointer-events-none');
+                        warning2.classList.remove('hidden');
+                        healthSection.classList.add('hidden');
                     }}
 
-                    document.getElementById('onboard-modal').classList.remove('hidden');
+                    overlay.classList.remove('hidden');
+                    setTimeout(() => {{
+                        panel.classList.remove('translate-x-full');
+                    }}, 10);
                 }}
 
                 function closeModal() {{ 
-                    document.getElementById('onboard-modal').classList.add('hidden');
-                    window.location.reload(); 
+                    const panel = document.getElementById('onboard-panel');
+                    const overlay = document.getElementById('panel-overlay');
+                    
+                    panel.classList.add('translate-x-full');
+                    
+                    setTimeout(() => {{
+                        overlay.classList.add('hidden');
+                        window.location.reload(); 
+                    }}, 300); 
                 }}
 
                 async function toggleActive(pId, newState) {{
@@ -742,7 +922,7 @@ def admin_dashboard():
 
                     const testBtn = document.getElementById('btn-test-connection');
                     const origTxt = testBtn.innerText;
-                    if (runTest) {{ testBtn.innerText = "Testing..."; testBtn.classList.add("opacity-70"); }}
+                    if (runTest) {{ testBtn.innerText = "Testing & Injecting..."; testBtn.classList.add("opacity-70"); }}
 
                     const payload = {{
                         project_id: document.getElementById('project-id').value,
@@ -762,16 +942,26 @@ def admin_dashboard():
                             
                             if (data.webhook_secret) {{
                                 updateYamlSnippet(data.project_id);
-                                document.getElementById('snippet-webhook-secret').innerText = data.webhook_secret;
+                                document.getElementById('snippet-webhook-secret').value = data.webhook_secret;
                             }}
                         }}
                         
                         if (runTest) {{
                             testBtn.innerText = origTxt; testBtn.classList.remove("opacity-70");
                             if (!data.success) alert("GitHub Test failed! Draft saved, verify permissions.");
-                            else alert("GitHub Webhook successfully connected!");
+                            else {{
+                                alert("GitHub Webhooks successfully injected!");
+                                document.getElementById('step-2-container').classList.remove('opacity-50', 'pointer-events-none');
+                                document.getElementById('step-2-warning').classList.add('hidden');
+                                
+                                document.getElementById('connection-health').classList.remove('hidden');
+                                document.getElementById('health-repo').className = 'w-3 h-3 rounded-full mr-2 shadow-sm bg-green-500';
+                                document.getElementById('health-webhooks').className = 'w-3 h-3 rounded-full mr-2 shadow-sm bg-green-500';
+                                
+                                toggleAccordion('step-2');
+                            }}
                         }} else {{
-                            switchTab(2); // Auto proceed to Linear tab
+                            closeModal(); 
                         }}
                     }} catch (err) {{ alert("Network error."); }}
                 }}
@@ -806,7 +996,7 @@ def admin_dashboard():
 
                     setTimeout(() => {{
                         btn.innerText = origText;
-                        btn.className = "text-xs bg-gray-100 hover:bg-gray-200 dark:bg-[#333333] dark:hover:bg-[#444444] text-gray-700 dark:text-gray-300 font-bold py-2 px-3 rounded border border-gray-300 dark:border-log-border transition";
+                        btn.className = "text-sm bg-gray-100 hover:bg-gray-200 dark:bg-[#333333] dark:hover:bg-[#444444] text-gray-700 dark:text-gray-300 font-bold py-2.5 px-4 rounded-lg border border-gray-300 dark:border-log-border transition shadow-sm";
                     }}, 4000);
                 }}
 
@@ -1325,6 +1515,128 @@ def project_workspace(project_id: str = Path(...)):
                 setInterval(fetchPipeline, 3000);
                 setInterval(fetchCompletedPipeline, 5000);
             </script>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+@router.get("/project/{project_id}/plan", response_class=HTMLResponse)
+def project_technical_plan(project_id: str = Path(...)):
+    """Renders the workspace Technical Plan page."""
+    vault = get_vault()
+    project_data = vault.get(project_id)
+    
+    if not project_data:
+        return HTMLResponse("<h1>Project Not Found</h1>", status_code=404)
+
+    project_name = project_data.get("project_name", project_id)
+    
+    # Query technical_plans table
+    architecture = "No architecture defined yet."
+    changelog = []
+    explored = []
+    
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT system_architecture, changelog, explored_approaches FROM technical_plans WHERE project_id = ?", (project_id,))
+            row = cursor.fetchone()
+            if row:
+                architecture = row[0]
+                try:
+                    changelog = json.loads(row[1]) if row[1] else []
+                except:
+                    pass
+                try:
+                    explored = json.loads(row[2]) if row[2] else []
+                except:
+                    pass
+    except Exception as e:
+        architecture = f"Error loading plan: {str(e)}"
+
+    # Build HTML lists
+    changelog_html = "".join([f'<li class="mb-2">{item}</li>' for item in changelog]) if changelog else '<li class="text-gray-500 italic">No history yet.</li>'
+    explored_html = "".join([f'<li class="mb-2">{item}</li>' for item in explored]) if explored else '<li class="text-gray-500 italic">No explored approaches logged.</li>'
+
+    html_content = f"""
+    <html>
+        <head>
+            <title>{project_name} - Technical Plan</title>
+            <script src="https://cdn.tailwindcss.com"></script>
+            <script>
+                tailwind.config = {{ darkMode: 'class', theme: {{ extend: {{ colors: {{ 'log-bg': '#1e1e1e', 'log-surface': '#252526', 'log-border': '#333333', 'log-text': '#d4d4d4' }} }} }} }};
+                
+                async function triggerSync(btn) {{
+                    const origText = btn.innerHTML;
+                    btn.innerText = "Checking Repo...";
+                    btn.disabled = true;
+                    btn.classList.add("opacity-50", "cursor-not-allowed");
+                    
+                    try {{
+                        const res = await fetch(`/api/project/{project_id}/plan/sync`, {{ method: 'POST' }});
+                        const data = await res.json();
+                        alert(data.message);
+                    }} catch (err) {{
+                        alert("Network error occurred.");
+                    }}
+                    
+                    btn.innerHTML = origText;
+                    btn.disabled = false;
+                    btn.classList.remove("opacity-50", "cursor-not-allowed");
+                }}
+            </script>
+        </head>
+        <body class="bg-gray-50 dark:bg-log-bg h-screen flex flex-col font-sans">
+            {get_layout_header()}
+            <div class="flex flex-1 overflow-hidden">
+                {get_project_sidebar_html(project_id, project_name, "plan")}
+                
+                <div class="flex-1 overflow-y-auto p-8">
+                    <div class="max-w-5xl mx-auto space-y-8">
+                        
+                        <div class="border-b border-gray-200 dark:border-log-border pb-4 flex justify-between items-end">
+                            <div>
+                                <h1 class="text-3xl font-medium text-gray-900 dark:text-white">Technical Plan</h1>
+                                <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Live architecture and historical logs for {project_name}</p>
+                            </div>
+                            <button onclick="triggerSync(this)" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 px-5 rounded-lg shadow-sm transition text-sm flex items-center">
+                                <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                Sync with Repo
+                            </button>
+                        </div>
+                        
+                        <div class="bg-white dark:bg-[#252526] border border-gray-200 dark:border-log-border rounded-xl p-6 shadow-sm">
+                            <h2 class="text-xl font-bold text-gray-800 dark:text-gray-200 mb-4 flex items-center">
+                                <svg class="w-5 h-5 mr-2 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                                System Architecture
+                            </h2>
+                            <div class="prose dark:prose-invert max-w-none text-sm text-gray-700 dark:text-gray-300 whitespace-pre-wrap font-mono leading-relaxed bg-gray-50 dark:bg-[#1e1e1e] p-5 rounded-lg border border-gray-200 dark:border-gray-700">{architecture}</div>
+                        </div>
+                        
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                            <div class="bg-white dark:bg-[#252526] border border-gray-200 dark:border-log-border rounded-xl p-6 shadow-sm">
+                                <h2 class="text-xl font-bold text-gray-800 dark:text-gray-200 mb-4 flex items-center">
+                                    <svg class="w-5 h-5 mr-2 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                    Changelog
+                                </h2>
+                                <ul class="list-disc list-outside pl-5 text-sm text-gray-700 dark:text-gray-300">
+                                    {changelog_html}
+                                </ul>
+                            </div>
+                            
+                            <div class="bg-white dark:bg-[#252526] border border-gray-200 dark:border-log-border rounded-xl p-6 shadow-sm">
+                                <h2 class="text-xl font-bold text-gray-800 dark:text-gray-200 mb-4 flex items-center">
+                                    <svg class="w-5 h-5 mr-2 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                                    Explored Approaches & Failures
+                                </h2>
+                                <ul class="list-disc list-outside pl-5 text-sm text-gray-700 dark:text-gray-300">
+                                    {explored_html}
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </body>
     </html>
     """

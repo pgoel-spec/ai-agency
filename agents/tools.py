@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from langchain_tavily import TavilySearch
+from database import update_technical_plan_db
 import shlex
 import json
 

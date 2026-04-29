@@ -121,18 +121,14 @@ async def process_preview_ready(tenant_id: str, ticket_id: str, preview_url: str
     else:
         return {"status": "error", "details": response.text}
 
-async def process_pr_closure(payload: dict, project_id: str, background_tasks):
-    """Listens for GitHub PR closures and triggers the Manager to update docs."""
+def process_pr_closure(payload: dict) -> str:
+    """Pure function to extract PR closure data and format the AI prompt."""
     pr_data = payload.get("pull_request", {})
     is_merged = pr_data.get("merged", False)
     pr_body = pr_data.get("body", "No description.")
     pr_title = pr_data.get("title", "Unknown PR")
     
     if is_merged:
-        human_input = f"SYSTEM ALERT: PR '{pr_title}' was MERGED into main. Please update the `system_architecture` and `changelog` based on this PR: {pr_body}"
+        return f"SYSTEM ALERT: PR '{pr_title}' was MERGED into main. Please update the `system_architecture` and `changelog` based on this PR: {pr_body}"
     else:
-        human_input = f"SYSTEM ALERT: PR '{pr_title}' was DISCARDED by the human. Please log this failure into `explored_approaches` so we don't repeat it."
-
-    # Dispatch this directly to the LangGraph Engine as a background task.
-    # The Manager will wake up, read the alert, use the database tools, and go back to sleep.
-    background_tasks.add_task(run_pipeline_task, f"doc-sync-{int(time.time())}", project_id, human_input, tenant_config)
+        return f"SYSTEM ALERT: PR '{pr_title}' was DISCARDED by the human. Please log this failure into `explored_approaches` so we don't repeat it."

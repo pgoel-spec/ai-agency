@@ -1,9 +1,10 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from database import get_active_tasks, get_pipeline_task, update_task_status, get_completed_tasks
+from database import get_active_tasks, get_pipeline_task, update_task_status, get_completed_tasks, get_db_conn, create_pipeline_task
 from engine import run_pipeline_task
-from onboarding import get_vault
+from dashboard_ui import get_vault
 import httpx
+import time
 
 router = APIRouter()
 
@@ -225,3 +226,60 @@ async def api_sync_github_status(project_id: str, task_id: str):
 
     else:
         return {"success": True, "message": f"Action ended with status: {conclusion}", "status": task.get("status")}
+
+@router.post("/api/project/{project_id}/plan/sync")
+async def api_sync_technical_plan(project_id: str, background_tasks: BackgroundTasks):
+    """Checks GitHub for new commits. If changes exist, triggers the AI to update the Technical Plan."""
+    vault = get_vault()
+    project_data = vault.get(project_id)
+    
+    if not project_data:
+        return {"success": False, "message": "Project not found."}
+        
+    github_repo = project_data.get("github_repo")
+    github_token = project_data.get("github_token")
+    
+    if not github_repo or not github_token:
+        return {"success": False, "message": "Missing GitHub credentials."}
+        
+    # 1. Fetch latest commit SHA from GitHub's main branch
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    api_url = f"https://api.github.com/repos/{github_repo}/commits/main"
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(api_url, headers=headers)
+        if resp.status_code != 200:
+            return {"success": False, "message": f"Failed to fetch from GitHub: {resp.status_code}"}
+            
+        data = resp.json()
+        latest_sha = data.get("sha")
+        
+    # 2. Check last sync SHA in Database
+    last_sync_sha = None
+    with get_db_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT last_sync_sha FROM technical_plans WHERE project_id = ?", (project_id,))
+        row = cursor.fetchone()
+        if row:
+            last_sync_sha = row[0]
+            
+    # If SHAs match, abort the sync
+    if last_sync_sha == latest_sha:
+        return {"success": True, "message": "Plan is already up to date with the latest code."}
+                
+    # 3. Trigger AI Background Task
+    human_input = f"SYSTEM ALERT: Manual sync triggered for commit {latest_sha}. Please analyze the repository to update the `system_architecture` and document recent changes in `changelog`."
+    task_id = f"manual-sync-{int(time.time())}"
+
+    # 4. Register the task in the database so it appears in the UI
+    try:
+        create_pipeline_task(task_id, project_id, human_input)
+    except Exception as e:
+        return {"success": False, "message": f"Database error: {str(e)}"}
+
+    background_tasks.add_task(run_pipeline_task, task_id, project_id, human_input, project_data)
+    
+    return {"success": True, "message": "Changes detected! A background task has been queued to sync the plan."}

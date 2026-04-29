@@ -10,12 +10,12 @@ from pydantic import BaseModel
 from datetime import datetime
 
 # Import from our modularized files
-from database import init_db, init_pipeline_db, get_pipeline_conn
-from onboarding import router as onboarding_router, get_vault
+from database import init_db, init_pipeline_db, get_pipeline_conn, update_task_status
+from dashboard_ui import router as dashboard_router, get_vault
 from log_viewer import router as log_viewer_router
 from engine import run_pipeline_task
 from pipeline_api import router as pipeline_router
-from webhook_handler import process_github_webhook, process_preview_ready, WebhookSecurityError
+from webhook_handler import process_github_webhook, process_preview_ready, WebhookSecurityError, process_pr_closure
 
 load_dotenv() # Load the .env file so the API keys are available to the tools
 
@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # Snap in our modular routers
-app.include_router(onboarding_router)
+app.include_router(dashboard_router)
 app.include_router(log_viewer_router)
 app.include_router(pipeline_router)
 
@@ -174,3 +174,27 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
     background_tasks.add_task(run_pipeline_task, task_id, project_id, human_input, tenant_config)
 
     return {"status": "Task queued in persistent pipeline", "ticket": ticket_id, "task": task_id}
+
+@app.post("/webhooks/github-pr-closed")
+async def github_pr_closed_webhook(request: Request, background_tasks: BackgroundTasks):
+    payload = await request.json()
+    project_id = request.query_params.get("project_id")
+    
+    if payload.get("action") == "closed":
+        # 1. Use the pure parser to get the AI string
+        human_input = process_pr_closure(payload)
+        
+        # 2. Fetch the tenant config (Main.py already does this for Linear)
+        vault = get_vault()
+        tenant_config = vault.get(project_id)
+        
+        if not tenant_config:
+            return {"status": "Ignored", "message": "Project not found."}
+            
+        # 3. Dispatch to the engine
+        task_id = f"doc-sync-{int(time.time())}"
+        background_tasks.add_task(run_pipeline_task, task_id, project_id, human_input, tenant_config)
+        
+        return {"status": "Doc sync task queued."}
+        
+    return {"status": "Ignored - Action is not closed."}

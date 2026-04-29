@@ -676,7 +676,10 @@ def manager_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
                 ))
             
             elif tool["name"] == "update_technical_plan":
-                tool_config = copy.deepcopy(config)
+                tool_config = {
+                    **config, 
+                    "configurable": {**config.get("configurable", {})}
+                }
                 # Inject RBAC identity
                 tool_config["configurable"]["agent_role"] = "Manager"
                 result = update_technical_plan.invoke(tool["args"], config=tool_config)
@@ -809,7 +812,7 @@ def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
     }
 
     # Fetch existing status
-    has_verified = state.get("has_verified_code", False)
+    has_verified = state.get("has_verified_code", True)
     current_phase = state.get("current_phase", "Implementation & Testing")
     current_status = state.get("current_status", "IN_PROGRESS")
     last_report = state.get("last_report", "")
@@ -852,14 +855,15 @@ def developer_tools_node(state: AgencyState, config: RunnableConfig) -> dict:
 
             # --- VERIFICATION TRACKING LOGIC ---
             if tool_name == "write_file":
-                # Check if the AI is ONLY updating the technical plan
                 files_written = tool["args"].get("files", [])
                 
-                # If every file being written is just the plan, do NOT reset the verification flag
-                is_only_docs = all("TECHNICAL_PLAN.md" in f.get("file_path", "") for f in files_written)
+                # Check if they are ONLY writing to docs
+                valid_docs = ["TECHNICAL_PLAN.md", ".env.example"]
+                is_only_docs = all(any(doc in f.get("file_path", "") for doc in valid_docs) for f in files_written)
                 
                 if not is_only_docs:
-                    has_verified = False # Reset verification when actual code changes
+                    has_verified = False # Fail verification when actual code changes
+
             elif tool_name in ["run_frontend_test", "run_backend_test", "run_unit_tests"]:
                 has_verified = True  # Successfully ran a pipeline test
             elif tool_name == "run_terminal_command":

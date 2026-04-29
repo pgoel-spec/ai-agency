@@ -1,6 +1,7 @@
 import time
 import requests
 import sqlite3
+import traceback
 from datetime import datetime
 from e2b_code_interpreter import Sandbox
 from agents.graph import workflow
@@ -350,11 +351,37 @@ def run_pipeline_task(task_id: str, project_id: str, human_input: str, tenant_co
             new_status="AWAITING_PREVIEW", 
             branch_name=f"feature-{task_id}"
         )
+
+        # 5. Update Technical Plan Sync State ONLY on Success
+        if task_id.startswith("manual-sync-"):
+            import re
+            # Extract the SHA that we injected into human_input
+            match = re.search(r'commit ([a-f0-9]+)', human_input, re.IGNORECASE)
+            if match:
+                latest_sha = match.group(1)
+                try:
+                    from database import get_db_conn
+                    with get_db_conn() as conn:
+                        conn.execute(
+                            "UPDATE technical_plans SET last_sync_sha = ? WHERE project_id = ?", 
+                            (latest_sha, project_id)
+                        )
+                        print(f"[SYSTEM]: Successfully locked manual sync state to commit {latest_sha}")
+                except Exception as db_err:
+                    print(f"[SYSTEM ERROR]: Failed to record sync state: {db_err}")
+            else:
+                print("[SYSTEM WARNING]: Could not find commit SHA in manual sync prompt.")
             
     except Exception as e:
         # Capture the crash reason
         error_msg = f"System Crash: {str(e)}"
         print(f"[PIPELINE ERROR] Task {task_id} crashed: {error_msg}")
         
+        # --- ADD THIS TO TRIAGE THE CRASH ---
+        print("\n=== FULL CRASH TRACEBACK ===")
+        traceback.print_exc()
+        print("============================\n")
+        # ------------------------------------
+
         # Save it to the database using the existing error_log parameter
         update_task_status(task_id, "Failed", error_log=error_msg)

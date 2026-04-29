@@ -64,7 +64,8 @@ def init_db():
                 system_architecture TEXT DEFAULT 'No architecture defined yet.',
                 active_ticket TEXT DEFAULT 'No active tasks.',
                 changelog TEXT DEFAULT '[]', -- Stored as JSON string for easy RAG integration later
-                explored_approaches TEXT DEFAULT '[]' -- Stored as JSON string
+                explored_approaches TEXT DEFAULT '[]', -- Stored as JSON string
+                last_sync_sha TEXT
             )
         ''')
 
@@ -231,6 +232,15 @@ def get_pipeline_task(task_id: str):
         cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
+
+def create_pipeline_task(task_id: str, project_id: str, human_input: str):
+    """Creates a new task in the pipeline queue."""
+    with get_pipeline_conn() as conn:
+        conn.execute(
+            """INSERT INTO tasks (task_id, project_id, status, human_input, created_at, updated_at) 
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (task_id, project_id, "Pending", human_input, datetime.utcnow().isoformat(), datetime.utcnow().isoformat())
+        )
 
 def update_task_status(task_id: str, new_status: str, error_log: str = None, commit_sha: str = None, branch_name: str = None):
     with get_pipeline_conn() as conn:

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
-from onboarding import get_layout_header, get_sidebar_html, get_project_sidebar_html, get_vault
+from dashboard_ui import get_layout_header, get_sidebar_html, get_project_sidebar_html, get_vault
 from database import get_all_sessions, get_logs_by_ticket, get_logs_by_session
 from datetime import datetime
 
